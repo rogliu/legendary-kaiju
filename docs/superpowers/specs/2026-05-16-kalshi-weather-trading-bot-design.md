@@ -1,7 +1,13 @@
 # Kalshi Weather Trading Bot — Design Spec
 
+> **SUPERSEDED (2026-05-17)** by
+> `docs/superpowers/specs/2026-05-17-kalshi-weather-mispricing-capture-design.md`
+> (v2: mispricing-capture / converge-to-fair strategy, WebSocket intraday loop,
+> nowcast fair value). Retained for history. Tasks 1–11 built under this v1
+> remain valid and are carried forward per the v2 spec §9.
+
 **Date:** 2026-05-16
-**Status:** Approved design, pending spec review
+**Status:** Superseded by v2
 **Codename:** legendary-kaiju (package: `kaiju`)
 
 ## 1. Goal
