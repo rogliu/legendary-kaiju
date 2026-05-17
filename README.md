@@ -345,16 +345,19 @@ sqlite3 kaiju.sqlite "SELECT status, brier, pnl, updated_at FROM gate ORDER BY u
 ### Structured logs
 
 The runner emits structured `logging` output at `INFO` and above. Log level
-`WARNING` or `ERROR` indicates a safety or data-quality condition. Watch for:
+`WARNING` or `ERROR` indicates a safety or data-quality condition. The
+`IEM observed_max not ready` line is `INFO` — it is a normal, expected
+condition before afternoon observations accumulate and does not require
+operator action. Watch for:
 
 | Log level | Message pattern | Meaning |
 |---|---|---|
 | `WARNING` | `SAFETY: pnl/realized-loss source not yet wired` | Daily-loss limit is currently inert (always logged at startup). |
 | `ERROR` | `UNSAFE: live mode with INERT daily-loss limit` | Running live without functional daily-loss protection — stop. |
-| `WARNING` | `IEM observed_max not ready` | Intraday nowcast skipped; using base PMF only. Normal until afternoon. |
+| `INFO` | `IEM observed_max not ready` | Intraday nowcast skipped; using base PMF only. Normal/expected until afternoon observations accumulate. |
 | `WARNING` | `NBM fetch failed` / `GEFS fetch failed` | Forecast source unavailable; trading tick may be skipped. |
 | `ERROR` | `tick error; continuing` | An exception in one evaluation tick was caught and suppressed; check the traceback. |
-| `INFO` | `WS reconnect / backoff` | WS connection dropped and is retrying — normal, watch for frequency. |
+| `WARNING` | `WS reconnect / backoff` | WS connection dropped and is retrying — normal, watch for frequency. |
 
 Configure log output by setting the root logger before running, or rely on
 `logging.basicConfig` in `__main__`.
