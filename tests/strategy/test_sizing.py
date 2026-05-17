@@ -33,12 +33,12 @@ def test_event_level_budget_shared_across_buckets():
     assert total_cost <= 0.10 * 500 + 1e-9   # shared event budget, not per-bucket
 
 
-def test_negative_or_zero_net_edge_dropped():
+def test_non_positive_edge_intent_dropped():
     assert size_event([_it("M", 0.5, 50, -0.1)], 500, 0.25, 0.10) == []
     assert size_event([_it("M", 0.5, 50, 0.0)], 500, 0.25, 0.10) == []
 
 
-def test_kelly_fraction_gt_one_still_budget_capped():
+def test_full_kelly_boundary_still_budget_capped():
     sized = size_event([_it("M", 0.9, 30, 0.5)], 500, 1.0, 0.10)
     assert sum(s.count * 0.30 for s in sized) <= 0.10 * 500 + 1e-9
 

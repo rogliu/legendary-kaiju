@@ -63,8 +63,6 @@ def test_frozen_blocks_mutation(monkeypatch):
 
 
 def test_config_rejects_out_of_range_kelly_and_frac(monkeypatch):
-    import pytest
-    from kaiju.config import Settings
     base = {"KALSHI_KEY_ID": "a", "KALSHI_PRIVATE_KEY": "k",
             "KAIJU_MODE": "backtest", "KAIJU_CITIES": "KNYC"}
     for k, v in [("KAIJU_KELLY_FRACTION", "1.5"), ("KAIJU_KELLY_FRACTION", "0"),
