@@ -1,5 +1,5 @@
 from __future__ import annotations
-from kaiju.types import TempPMF, Bucket, MarketQuote, TradeIntent
+from kaiju.types import TempPMF, Bucket, MarketQuote, TradeIntent, Position
 from kaiju.strategy.fees import trade_fee_cents
 
 
@@ -38,3 +38,28 @@ def select_trades(model_probs: dict[str, float], quotes: dict[str, MarketQuote],
             if edge >= net_edge_threshold:
                 intents.append(TradeIntent(tkr, "no", q.no_ask, 1, p, edge))
     return intents
+
+
+def select_gap_trades(fair_cents: dict[str, int], quotes: dict[str, MarketQuote],
+                       positions: dict[str, Position], net_edge_threshold: float,
+                       min_open_interest: int) -> list[TradeIntent]:
+    """Enter the cheap side when |fair-market| clears fee+spread+threshold.
+    Position-aware: skip a market we already hold (exits handled elsewhere)."""
+    out: list[TradeIntent] = []
+    for tkr, fair in fair_cents.items():
+        if tkr in positions:
+            continue
+        q = quotes.get(tkr)
+        if q is None or q.open_interest < min_open_interest:
+            continue
+        p = fair / 100.0
+        if q.yes_ask is not None and 1 <= q.yes_ask <= 99:
+            edge = p - q.yes_ask / 100.0 - trade_fee_cents(q.yes_ask, 1) / 100.0
+            if edge >= net_edge_threshold:
+                out.append(TradeIntent(tkr, "yes", q.yes_ask, 1, p, edge))
+                continue
+        if q.no_ask is not None and 1 <= q.no_ask <= 99:
+            edge = (1.0 - p) - q.no_ask / 100.0 - trade_fee_cents(q.no_ask, 1) / 100.0
+            if edge >= net_edge_threshold:
+                out.append(TradeIntent(tkr, "no", q.no_ask, 1, 1.0 - p, edge))
+    return out
