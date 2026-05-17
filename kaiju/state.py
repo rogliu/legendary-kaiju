@@ -109,6 +109,7 @@ class State:
         avg_entry_cents: int,
         climate_date: str,
     ) -> None:
+        """Wholesale-replace the position row; caller must pass the POST-aggregation total count and weighted avg_entry_cents (NOT a single fill)."""
         self.conn.execute(
             "INSERT INTO positions(market,side,count,avg_entry_cents,climate_date)"
             " VALUES(?,?,?,?,?)"
