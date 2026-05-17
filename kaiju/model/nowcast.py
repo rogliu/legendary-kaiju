@@ -15,6 +15,8 @@ def nowcast_pmf(base: TempPMF, observed_max_f: int, minutes_past_peak: int,
       renormalized (no artificial point mass) -- except when the
       observation falls entirely outside model support, in which case a
       degenerate point mass at observed_max_f is returned.
+
+    minutes_past_peak is reserved for future tuning; the ceiling formula is currently identical regardless of its sign.
     """
     temps = np.arange(base.low_f, base.high_f + 1)
     floor = observed_max_f
@@ -25,9 +27,5 @@ def nowcast_pmf(base: TempPMF, observed_max_f: int, minutes_past_peak: int,
     mask = (temps >= floor) & (temps <= ceil)
     w = np.where(mask, base.probs, 0.0)
     if w.sum() <= 0:
-        lo = min(observed_max_f, base.low_f)
-        hi = max(observed_max_f, base.high_f)
-        grid = np.zeros(hi - lo + 1)
-        grid[observed_max_f - lo] = 1.0
-        return TempPMF.from_probs(low_f=lo, probs=grid)
+        return TempPMF.from_probs(low_f=observed_max_f, probs=[1.0])
     return TempPMF.from_probs(low_f=base.low_f, probs=w)
