@@ -47,6 +47,7 @@ Known v1 limitations
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any
 
 from kaiju.state import State
@@ -876,7 +877,9 @@ def settle_day(
     PIT uniformity p-value:
         pit_values = [pit_value(pmf, realized_max) for each day]
         KS test: scipy.stats.kstest(pit_values, 'uniform') -> p-value.
-        If scipy unavailable (or < 5 days): p set to 0.5 (neutral, does not fail gate).
+        If scipy unavailable (or < 5 days): p = 0.0 (fail-closed — insufficient data
+        means the calibration check cannot be trusted; consistent with the
+        project's "if in doubt, don't trade" safety policy).
 
     sim_pnl_usd:
         Sum of realized_usd from all pnl rows in the trailing window.
@@ -918,6 +921,40 @@ def settle_day(
             "reason": str(exc),
         }
 
+    # --- Idempotency guard ---
+    # settle_day is idempotent: the first settlement for (date, station) computes &
+    # persists realized PnL from positions; subsequent calls preserve the persisted
+    # pnl and only refresh the gate from stored data (safe for cron retries).
+    existing_sett = state.get_settlement(climate_date, station)
+    if existing_sett is not None:
+        # Already settled: use the persisted realized_max, read back pnl row, and
+        # refresh the gate (deterministic from stored data) — do NOT recompute from
+        # now-possibly-empty positions (would clobber real PnL with 0.0).
+        persisted_max = existing_sett["realized_max"]
+        pnl_row = state.conn.execute(
+            "SELECT realized_usd FROM pnl WHERE climate_date=? AND mode=?",
+            (climate_date, mode),
+        ).fetchone()
+        persisted_usd = pnl_row[0] if pnl_row is not None else 0.0
+        log.info(
+            "settle_day: %s already settled; gate refreshed, pnl preserved",
+            climate_date,
+        )
+        gate_result = _compute_gate(state, station, mode)
+        status_str = "qualified" if gate_result.qualified else "not_qualified"
+        trailing_brier, trailing_pnl = _trailing_brier_and_pnl(state, station, mode)
+        if not math.isfinite(trailing_brier):
+            trailing_brier = 9999.0
+        state.set_gate_status(status_str, trailing_brier, trailing_pnl)
+        return {
+            "station": station,
+            "climate_date": climate_date,
+            "realized_max": persisted_max,
+            "realized_usd": persisted_usd,
+            "gate": gate_result.reason,
+            "already_settled": True,
+        }
+
     # --- Persist realized max (enables real gate calibration metrics) ---
     # Written on the success path only; LookupError path returned above without writing.
     state.record_settlement(climate_date, station, realized_max, mode)
@@ -938,7 +975,7 @@ def settle_day(
         # Open-tail tickers (LO, HI, or any non-integer suffix) are skipped.
         lower_f = _parse_bucket_lower(market)
         if lower_f is None:
-            log.info(
+            log.warning(
                 "settle_day: skipping position %s — cannot parse bucket "
                 "integer from ticker (tail bucket or non-standard suffix)",
                 market,
@@ -972,8 +1009,7 @@ def settle_day(
     # _trailing_brier_and_pnl returns float('inf') when no paired data — clamp to
     # a large finite value so the REAL SQLite column accepts it without error.
     trailing_brier, trailing_pnl = _trailing_brier_and_pnl(state, station, mode)
-    import math as _math
-    if not _math.isfinite(trailing_brier):
+    if not math.isfinite(trailing_brier):
         trailing_brier = 9999.0
     state.set_gate_status(status_str, trailing_brier, trailing_pnl)
 

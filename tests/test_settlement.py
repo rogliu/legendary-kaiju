@@ -10,6 +10,7 @@ Contract verified:
     not a hardcoded stub — proved by test_well_calibrated_history and
     test_miscalibrated_history_fails_calibration below.
 """
+import pytest
 from kaiju.runner import settle_day, _compute_gate
 from kaiju.state import State
 
@@ -212,4 +213,172 @@ def test_miscalibrated_history_fails_calibration(tmp_path):
     assert not result.qualified, "Miscalibrated history must not qualify"
     assert result.reason == "calibration not better than market", (
         f"Miscalibrated history must fail with calibration reason. Got: {result.reason!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — idempotency: re-run must not clobber real PnL with 0.0
+# ---------------------------------------------------------------------------
+
+
+def test_settle_day_rerun_is_idempotent(tmp_path):
+    """settle_day called a second time for the same (climate_date, station) must NOT
+    recompute realized_usd from (now-cleared) positions and clobber the persisted PnL.
+
+    First run: position held → realized_usd is non-zero.
+    After first run: positions cleared (simulate cron / position-manager clear).
+    Second run: same date → should return already_settled=True, preserved realized_usd.
+    """
+    import sqlite3
+
+    db = str(tmp_path / "idem.sqlite")
+    st = State(db)
+    st.init_schema()
+
+    station = "NYC"
+    climate_date = "2026-05-17"
+    series_ticker = "KXHIGHNY"
+    mode = "shadow-paper"
+
+    # Seed a prediction and a position that pays out.
+    st.record_prediction(station, climate_date, 65, [0.0, 1.0, 0.0])
+    # Position: bought 5 yes contracts on B66 (the winning bucket) at 40¢.
+    # Official max=66 → in-bucket → payoff 100¢ → pnl = 5*(100-40)/100 = 3.0 USD.
+    st.upsert_position("KXHIGHNY-26MAY17-B66", "yes", 5, 40, climate_date)
+
+    class DepsWith66:
+        def official_daily_max(self, *a, **kw) -> int:
+            return 66
+
+    # --- First settlement run ---
+    res1 = settle_day(
+        station=station,
+        climate_date=climate_date,
+        db_path=db,
+        deps=DepsWith66(),
+        series_ticker=series_ticker,
+        mode=mode,
+    )
+    assert res1["realized_max"] == 66
+    assert res1["realized_usd"] == pytest.approx(3.0)
+    assert res1.get("already_settled") is None  # first run: no flag
+
+    # Verify pnl row is written with the real value.
+    conn = sqlite3.connect(db)
+    row = conn.execute(
+        "SELECT realized_usd FROM pnl WHERE climate_date=? AND mode=?",
+        (climate_date, mode),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == pytest.approx(3.0)
+
+    # Clear positions (simulates PositionManager.clear or end-of-day cleanup).
+    # Direct delete simulates any external clearing of positions.
+    conn.execute("DELETE FROM positions")
+    conn.commit()
+    conn.close()
+
+    # --- Second settlement run (re-run with no positions remaining) ---
+    res2 = settle_day(
+        station=station,
+        climate_date=climate_date,
+        db_path=db,
+        deps=DepsWith66(),
+        series_ticker=series_ticker,
+        mode=mode,
+    )
+    assert res2["already_settled"] is True, "Re-run must signal already_settled"
+    assert res2["realized_max"] == 66, "Persisted realized_max must be returned"
+    assert res2["realized_usd"] == pytest.approx(3.0), (
+        "Re-run must NOT clobber realized_usd with 0.0 (positions were cleared)"
+    )
+
+    # Verify the pnl row in the database is STILL the real value.
+    conn2 = sqlite3.connect(db)
+    row2 = conn2.execute(
+        "SELECT realized_usd FROM pnl WHERE climate_date=? AND mode=?",
+        (climate_date, mode),
+    ).fetchone()
+    assert row2 is not None
+    assert row2[0] == pytest.approx(3.0), (
+        "DB pnl row must preserve real realized_usd after re-run with cleared positions"
+    )
+    conn2.close()
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — end-to-end gate qualifiability: a genuinely good model must qualify
+# ---------------------------------------------------------------------------
+
+
+def test_well_calibrated_history_qualifies_end_to_end(tmp_path):
+    """Prove the gate is passable by a realistic well-calibrated history.
+
+    Construction (deterministic, seeded by index — not random):
+    - 35 climate_dates (> 30 required minimum).
+    - Varied true centers cycling through 60..79°F.
+    - Wide Gaussian PMF (sigma=3, 15 bins) centered at each day's center so the
+      model is reasonably sharp relative to the uniform baseline.
+    - realized_max chosen via inverse-CDF at quasi-uniform fraction u_d=(d+0.5)/N:
+      this makes the empirical PIT ≈ uniform by construction so KS p >> 0.05.
+    - All pnl rows set to +1.0 USD (positive, zero drawdown) so the financial
+      criteria pass trivially.
+
+    This test asserts qualified == True — it must FAIL if the gate's criteria
+    cannot be met by a realistic well-calibrated model (that would be a gate defect).
+    """
+    import math as _math
+
+    db = str(tmp_path / "e2e.sqlite")
+    st = State(db)
+    st.init_schema()
+
+    station = "NYC"
+    mode = "shadow-paper"
+    N = 35
+
+    def _gaussian_probs_wide(center: int, sigma: float = 3.0) -> tuple[int, list[float]]:
+        """Return (low_f, probs) for a 15-bin discretized Gaussian PMF."""
+        low_f = center - 7
+        temps = list(range(low_f, low_f + 15))
+        raw = [_math.exp(-((t - center) ** 2) / (2 * sigma ** 2)) for t in temps]
+        total = sum(raw)
+        return low_f, [r / total for r in raw]
+
+    def _icdf_realized_max(center: int, u: float) -> int:
+        """Return the realized_max where CDF first reaches u (inverse-CDF sampling)."""
+        low_f, probs = _gaussian_probs_wide(center)
+        temps = list(range(low_f, low_f + 15))
+        cdf = 0.0
+        for t, p in zip(temps, probs):
+            cdf += p
+            if cdf >= u:
+                return t
+        return temps[-1]  # fallback: top bin
+
+    # Build 35 days of paired predictions and settlements.
+    for d in range(N):
+        # Varied centers: cycle through 60, 61, ..., 79 (20 distinct values).
+        center = 60 + (d * 20 // N)
+        low_f, probs = _gaussian_probs_wide(center)
+        # Quasi-uniform quantile for day d ensures empirical PIT ≈ uniform.
+        u_d = (d + 0.5) / N
+        realized_max = _icdf_realized_max(center, u_d)
+        # Dates: 2026-03-01 .. 2026-04-04 (35 days)
+        day_of_month = d + 1  # 1..35
+        if day_of_month <= 31:
+            date_str = f"2026-03-{day_of_month:02d}"
+        else:
+            date_str = f"2026-04-{(day_of_month - 31):02d}"
+        st.record_prediction(station, date_str, low_f, probs)
+        st.record_settlement(date_str, station, realized_max, mode)
+        st.record_pnl(date_str, 1.0, mode)  # positive, no drawdown
+
+    result = _compute_gate(st, station, mode)
+
+    assert result.qualified, (
+        f"A well-calibrated history with varied centers and inverse-CDF PIT "
+        f"construction MUST qualify the gate. Got reason: {result.reason!r}. "
+        f"If this assertion fails, there is a gate-design defect: a realistically "
+        f"good model cannot pass the promotion gate."
     )
