@@ -1250,20 +1250,22 @@ def _pmf_median(low_f: int, probs: list[float]) -> int:
 
     The median is defined as the smallest integer temperature T such that the
     cumulative probability from low_f up to (and including) T is >= 0.5.
-    Operates directly on the stored probs list (no normalisation needed; probs
-    from TempPMF.from_probs are already normalised at storage time).
+    Assumes probs are caller-normalised (record_prediction stores the list as-is;
+    callers using TempPMF.from_probs get normalised probs).
 
     Example: low_f=59, probs=[0.2, 0.6, 0.2]
         cumsum at T=59: 0.2  (<0.5)
         cumsum at T=60: 0.8  (>=0.5) → median = 60
     """
+    if not probs:
+        raise ValueError(f"_pmf_median: empty probs for low_f={low_f}")
     cumsum = 0.0
     for i, p in enumerate(probs):
         cumsum += p
         if cumsum >= 0.5:
             return low_f + i
-    # Fallback: return the last temperature in the support (should not happen
-    # for a well-formed PMF where sum(probs) >= 1.0, but guard for safety).
+    # Fallback: return the last temperature in the support (only reached for a
+    # non-empty list whose cumulative never reaches 0.5 due to fp — use top bin).
     return low_f + len(probs) - 1
 
 
@@ -1301,8 +1303,9 @@ def retrain_calibration(
     - Env-free: never constructs Settings.  Safe to call from tests with no env.
     - Skips settlement rows whose realized_max is None or whose station does not
       match; skips settlements with no matching stored prediction.
-    - Persists via state.set_calibration even for n=0 (identity); this lets
-      run_intraday read a row and apply a no-op calibration without a special case.
+    - n=0 (no paired samples) returns the identity CalibrationParams but does NOT
+      persist — never overwrite a previously-good calibration with identity
+      (run_intraday treats a missing row as identity).
     - run_intraday already loads calibration via state.get_calibration(station)
       before nowcast — this function is the offline job that refreshes that row.
     """
@@ -1329,7 +1332,8 @@ def retrain_calibration(
 
     cal: CalibrationParams = fit_calibration(fc_medians, realized, min_samples)
 
-    state.set_calibration(station, cal.bias, cal.spread_scale, cal.n_samples)
+    if cal.n_samples > 0:
+        state.set_calibration(station, cal.bias, cal.spread_scale, cal.n_samples)
 
     return cal
 

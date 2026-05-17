@@ -65,3 +65,22 @@ def test_cli_retrain_runs_and_persists(tmp_path):
     assert "not yet implemented" not in (r.stdout + r.stderr)
     st2 = State(db)
     assert st2.get_calibration("NYC") is not None and st2.get_calibration("NYC")["n"] == 3
+
+
+def test_retrain_no_data_does_not_overwrite_existing_calibration(tmp_path):
+    db = str(tmp_path / "s.sqlite")
+    from kaiju.state import State
+    st = State(db)
+    st.init_schema()
+    st.set_calibration("NYC", bias=-2.5, spread_scale=1.1, n=30)   # good calibration exists
+    cal = retrain_calibration(station="NYC", db_path=db)             # no settlements -> n=0
+    assert cal.n_samples == 0 and cal.bias == 0.0 and cal.spread_scale == 1.0   # returns identity
+    got = st.get_calibration("NYC")
+    assert got["bias"] == -2.5 and got["n"] == 30                      # PRESERVED, not wiped
+
+
+def test_pmf_median_empty_probs_raises():
+    from kaiju.runner import _pmf_median
+    import pytest
+    with pytest.raises(ValueError):
+        _pmf_median(60, [])
