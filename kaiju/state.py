@@ -177,3 +177,22 @@ class State:
             "SELECT * FROM calibration WHERE station=?", (station,)
         ).fetchone()
         return dict(r) if r else None
+
+    def record_pnl(self, climate_date: str, realized_usd: float, mode: str) -> None:
+        """Upsert a pnl row for the given climate_date.
+
+        Columns written: climate_date (PK), realized_usd, mode.
+        These EXACTLY match the columns queried by runner._realized_loss_today:
+            SELECT realized_usd FROM pnl WHERE climate_date=? AND mode=?
+        Writing this row activates the RiskGate daily-loss limit (previously inert).
+
+        Note: climate_date is the sole PRIMARY KEY so one row is kept per date.
+        If mode changes between settlement runs the last writer wins (upsert).
+        """
+        self.conn.execute(
+            "INSERT INTO pnl(climate_date, realized_usd, mode) VALUES(?,?,?)"
+            " ON CONFLICT(climate_date) DO UPDATE SET"
+            " realized_usd=excluded.realized_usd, mode=excluded.mode",
+            (climate_date, realized_usd, mode),
+        )
+        self.conn.commit()
