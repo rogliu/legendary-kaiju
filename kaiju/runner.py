@@ -14,10 +14,18 @@ run_intraday(station, mode, *, settings=None) -> None
     Heavy imports (herbie, websockets, httpx) are deferred inside this
     function so offline tests never trigger them.
 
+retrain_calibration(station, db_path, *, min_samples=30) -> CalibrationParams
+    Pair stored PMF predictions with persisted settlements (by station+climate_date),
+    compute forecast medians (smallest T where cumulative prob >= 0.5), and fit
+    bias/spread calibration via fit_calibration with shrinkage.  Persists the result
+    via state.set_calibration.  Env-free: never constructs Settings internally.
+    run_intraday already applies the stored calibration before nowcast via
+    state.get_calibration(station) -> apply_calibration.
+
 CLI (python -m kaiju.runner):
     run      --station --mode
-    settle   (stub; implemented in Task 18)
-    retrain  (stub; implemented in Task 19)
+    settle   (implemented in Task 18)
+    retrain  --station [--db]  (implemented in Task 19)
 
 Cross-task contracts honoured
 ------------------------------
@@ -57,7 +65,7 @@ from kaiju.risk.limits import RiskGate
 from kaiju.types import ExitAction, ExitDecision
 
 if TYPE_CHECKING:
-    pass
+    from kaiju.model.calibration import CalibrationParams
 
 log = logging.getLogger(__name__)
 
@@ -1231,6 +1239,99 @@ def _max_drawdown(pnl_series: list[float]) -> float:
         if dd > max_dd:
             max_dd = dd
     return max_dd
+
+
+# ---------------------------------------------------------------------------
+# Calibration retrain (Task 19)
+# ---------------------------------------------------------------------------
+
+def _pmf_median(low_f: int, probs: list[float]) -> int:
+    """Return the forecast median of a discrete PMF.
+
+    The median is defined as the smallest integer temperature T such that the
+    cumulative probability from low_f up to (and including) T is >= 0.5.
+    Operates directly on the stored probs list (no normalisation needed; probs
+    from TempPMF.from_probs are already normalised at storage time).
+
+    Example: low_f=59, probs=[0.2, 0.6, 0.2]
+        cumsum at T=59: 0.2  (<0.5)
+        cumsum at T=60: 0.8  (>=0.5) → median = 60
+    """
+    cumsum = 0.0
+    for i, p in enumerate(probs):
+        cumsum += p
+        if cumsum >= 0.5:
+            return low_f + i
+    # Fallback: return the last temperature in the support (should not happen
+    # for a well-formed PMF where sum(probs) >= 1.0, but guard for safety).
+    return low_f + len(probs) - 1
+
+
+def retrain_calibration(
+    station: str,
+    db_path: str,
+    *,
+    min_samples: int = 30,
+) -> "CalibrationParams":
+    """Fit and persist a CalibrationParams for the given station.
+
+    Pairs stored PMF predictions with persisted settlement rows strictly by
+    (station, climate_date).  For each matched pair the forecast median is
+    computed via _pmf_median (smallest T with cumulative prob >= 0.5) and
+    paired with the persisted realized_max integer.
+
+    Parameters
+    ----------
+    station:
+        Station identifier (e.g. "NYC").
+    db_path:
+        Path to the SQLite state file.
+    min_samples:
+        Shrinkage sample size for fit_calibration.  Default 30 (same as
+        Settings.paper_proof_days) without requiring Settings construction.
+        The CLI passes Settings().paper_proof_days explicitly.
+
+    Returns
+    -------
+    CalibrationParams with bias, spread_scale, n_samples.
+    n_samples=0 → identity (bias=0, spread_scale=1) from fit_calibration.
+
+    Notes
+    -----
+    - Env-free: never constructs Settings.  Safe to call from tests with no env.
+    - Skips settlement rows whose realized_max is None or whose station does not
+      match; skips settlements with no matching stored prediction.
+    - Persists via state.set_calibration even for n=0 (identity); this lets
+      run_intraday read a row and apply a no-op calibration without a special case.
+    - run_intraday already loads calibration via state.get_calibration(station)
+      before nowcast — this function is the offline job that refreshes that row.
+    """
+    from kaiju.model.calibration import fit_calibration
+
+    state = State(db_path)
+    state.init_schema()
+
+    fc_medians: list[float] = []
+    realized: list[float] = []
+
+    for sett in state.list_settlements():
+        if sett["station"] != station:
+            continue
+        if sett["realized_max"] is None:
+            continue
+        climate_date = sett["climate_date"]
+        pred = state.get_prediction(station, climate_date)
+        if pred is None:
+            continue
+        median = _pmf_median(pred["low_f"], pred["probs"])
+        fc_medians.append(float(median))
+        realized.append(float(sett["realized_max"]))
+
+    cal: CalibrationParams = fit_calibration(fc_medians, realized, min_samples)
+
+    state.set_calibration(station, cal.bias, cal.spread_scale, cal.n_samples)
+
+    return cal
 
 
 # ---------------------------------------------------------------------------
