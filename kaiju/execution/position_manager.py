@@ -36,6 +36,14 @@ The runner MUST call ``clear_working_orders_for_market(market)`` when that
 market's order fills or is cancelled (WS fill events) and on settlement;
 ``reconcile()`` clears markets the broker confirms.
 
+SHADOW-PAPER PAPER-PROOF INTEGRITY: in shadow-paper mode there are no WS fill
+events and reconcile's broker response is empty, so the Task 16 PaperBook fill
+simulator (or the Task 17 shadow-paper fill loop) MUST call
+clear_working_orders_for_market(market) on every SIMULATED fill — exactly as
+live does on WS fill events. If it does not, every market is permanently blocked
+after its first order and the paper-proof gate metrics (Brier/PnL/CRPS) are
+invalid.
+
 Reconcile
 ---------
 ``reconcile()`` is ``async def`` so WsClient can ``await pm.reconcile()``
