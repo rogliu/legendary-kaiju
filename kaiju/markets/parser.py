@@ -156,9 +156,18 @@ def parse_event_snapshot(
       - volume_fp         : FixedPointCount string  (HAZARD 2 source)
       - open_interest_fp  : FixedPointCount string  (HAZARD 2 source)
 
+    Dollar->cents uses round(float*100); for the standard 0.01-step (linear_cent) tier
+    there are no exact half-cents. Sub-cent (tapered_deci_cent) extreme prices
+    (e.g. 0.001-0.009) collapse to 0/100 cents; a resulting 0/100 ask is excluded
+    downstream by select_trades' 1<=price<=99 guard.
+
+    Absent `volume_fp`/`open_interest_fp` keys default to 0 (conservative:
+    select_trades skips low-OI markets) — distinct from a present null which raises.
+
     Raises:
       KeyError  — if 'ticker' is missing from a market dict
       ValueError — if both floor_strike and cap_strike are None (degenerate)
+      ValueError — if lower_f > upper_f after *.5->int conversion (inverted band)
       ValueError — if any numeric field is non-parseable
     """
     buckets: list[Bucket] = []
@@ -196,6 +205,14 @@ def parse_event_snapshot(
             upper_f = None
         else:
             upper_f = _upper_int(float(raw_cap))
+
+        if lower_f is not None and upper_f is not None and lower_f > upper_f:
+            raise ValueError(
+                f"Market {ticker!r}: inverted integer band after *.5->int conversion "
+                f"(lower_f={lower_f} > upper_f={upper_f}; floor_strike={raw_floor!r}, "
+                f"cap_strike={raw_cap!r}). Only well-formed brackets with "
+                f"floor_strike < cap_strike are supported."
+            )
 
         bucket = Bucket(
             market_ticker=ticker,

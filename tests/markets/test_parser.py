@@ -194,3 +194,37 @@ def test_parse_raises_on_both_strikes_null():
     ]
     with pytest.raises(ValueError):
         parse_event_snapshot("E", "NYTNYC", "2026-05-17", raw)
+
+
+def test_inverted_band_raises():
+    raw = [{"ticker": "BAD", "floor_strike": 69.5, "cap_strike": 69.5,
+            "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.45", "no_bid_dollars": "0.55", "no_ask_dollars": "0.60",
+            "volume_fp": "10", "open_interest_fp": "300"}]
+    with pytest.raises(ValueError, match="inverted"):
+        parse_event_snapshot("E", "NYTNYC", "2026-05-17", raw)
+
+
+def test_contiguous_ladder_tiles_with_no_gap_no_overlap():
+    # standard contiguous *.5 ladder: 67.5/68.5, 68.5/69.5, 69.5/70.5 -> (68,68),(69,69),(70,70)
+    def m(t, f, c):
+        return {"ticker": t, "floor_strike": f, "cap_strike": c,
+                "yes_bid_dollars": "0.10", "yes_ask_dollars": "0.12", "no_bid_dollars": "0.88", "no_ask_dollars": "0.90",
+                "volume_fp": "10", "open_interest_fp": "300"}
+    raw = [m("A", 67.5, 68.5), m("B", 68.5, 69.5), m("C", 69.5, 70.5)]
+    snap = parse_event_snapshot("E", "NYTNYC", "2026-05-17", raw)
+    bands = sorted((b.lower_f, b.upper_f) for b in snap.buckets)
+    assert bands == [(68, 68), (69, 69), (70, 70)]
+    # no gap and no overlap between consecutive bands
+    for (lo1, hi1), (lo2, lo2u) in zip(bands, bands[1:]):
+        assert lo2 == hi1 + 1            # no gap, no shared integer
+
+
+def test_single_bad_market_aborts_whole_snapshot():
+    good = {"ticker": "G", "floor_strike": 68.5, "cap_strike": 69.5,
+            "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.45", "no_bid_dollars": "0.55", "no_ask_dollars": "0.60",
+            "volume_fp": "10", "open_interest_fp": "300"}
+    bad = {"floor_strike": 70.5, "cap_strike": 71.5,  # missing 'ticker'
+           "yes_bid_dollars": "0.40", "yes_ask_dollars": "0.45", "no_bid_dollars": "0.55", "no_ask_dollars": "0.60",
+           "volume_fp": "10", "open_interest_fp": "300"}
+    with pytest.raises((KeyError, ValueError)):
+        parse_event_snapshot("E", "NYTNYC", "2026-05-17", [good, bad])
