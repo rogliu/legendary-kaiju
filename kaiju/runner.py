@@ -918,6 +918,10 @@ def settle_day(
             "reason": str(exc),
         }
 
+    # --- Persist realized max (enables real gate calibration metrics) ---
+    # Written on the success path only; LookupError path returned above without writing.
+    state.record_settlement(climate_date, station, realized_max, mode)
+
     # --- Score held-to-settlement positions ---
     all_positions = state.list_positions()
     day_positions = [p for p in all_positions if p.get("climate_date") == climate_date]
@@ -964,8 +968,13 @@ def settle_day(
 
     # --- Persist gate status ---
     status_str = "qualified" if gate_result.qualified else "not_qualified"
-    # Compute trailing brier for set_gate_status signature (status, brier, pnl).
+    # Compute trailing brier/pnl for set_gate_status signature (status, brier, pnl).
+    # _trailing_brier_and_pnl returns float('inf') when no paired data — clamp to
+    # a large finite value so the REAL SQLite column accepts it without error.
     trailing_brier, trailing_pnl = _trailing_brier_and_pnl(state, station, mode)
+    import math as _math
+    if not _math.isfinite(trailing_brier):
+        trailing_brier = 9999.0
     state.set_gate_status(status_str, trailing_brier, trailing_pnl)
 
     return {
@@ -998,34 +1007,92 @@ def _parse_bucket_lower(market_ticker: str) -> int | None:
 def _trailing_brier_and_pnl(
     state: State, station: str, mode: str
 ) -> tuple[float, float]:
-    """Return (mean_crps, sum_realized_usd) over settled days.
+    """Return (mean_crps, sum_realized_usd) over settled days that have both a
+    stored prediction and a stored settlement.
 
-    Helper extracted to avoid repeating the join query.
-    Returns (0.25, 0.0) as safe defaults when no data is available.
+    mean_crps is the real model CRPS computed from TempPMF predictions vs
+    realized official max values.  Returns (float('inf'), 0.0) when no paired
+    data is available (fail-closed: inf CRPS never beats a baseline).
     """
-    # Fetch all pnl rows for this mode.
+    from kaiju.eval.metrics import crps_pmf
+    from kaiju.types import TempPMF
+
     pnl_rows = state.conn.execute(
-        "SELECT climate_date, realized_usd FROM pnl WHERE mode=?",
+        "SELECT climate_date, realized_usd FROM pnl WHERE mode=? ORDER BY climate_date",
         (mode,),
     ).fetchall()
     pnl_by_date = {r[0]: r[1] for r in pnl_rows}
     sum_pnl = sum(pnl_by_date.values())
 
-    # CRPS cannot be computed without persisted realized_max (v1 gap).
-    # Return a neutral brier proxy (0.25) and the actual pnl sum.
-    # Task 20 should persist realized_max to enable real CRPS computation.
-    return 0.25, sum_pnl
+    crps_values: list[float] = []
+    for cd in sorted(pnl_by_date.keys()):
+        pred = state.get_prediction(station, cd)
+        if pred is None:
+            continue
+        sett = state.get_settlement(cd, station)
+        if sett is None:
+            continue
+        pmf = TempPMF.from_probs(pred["low_f"], pred["probs"])
+        crps_values.append(crps_pmf(pmf, sett["realized_max"]))
+
+    if not crps_values:
+        return float("inf"), sum_pnl
+
+    mean_crps = sum(crps_values) / len(crps_values)
+    return mean_crps, sum_pnl
 
 
 def _compute_gate(state: State, station: str, mode: str):
-    """Recompute gate result from stored predictions + pnl rows.
+    """Recompute gate result from stored predictions, settlements, and pnl rows.
 
-    See settle_day docstring for the documented metric definitions.
-    Returns a GateResult (qualified, reason).
+    METRIC DEFINITIONS (authoritative):
+    ------------------------------------
+    model metric (brier arg to evaluate_promotion):
+        Mean CRPS of stored TempPMF predictions vs realized NWS official max.
+        For each climate_date d that has BOTH a stored prediction
+        (state.get_prediction) AND a stored settlement (state.get_settlement):
+            pmf_d = TempPMF.from_probs(pred["low_f"], pred["probs"])
+            crps_d = crps_pmf(pmf_d, settlement["realized_max"])
+        model_metric = mean(crps_d). Lower is better.
+        evaluate_promotion fails if brier >= market_baseline_brier.
+
+    baseline (market_baseline_brier):
+        Mean CRPS of a uniform-climatology PMF over the window's realized-max range.
+        range = [min(realized_max in window), max(realized_max in window)].
+        If range is degenerate (< 2 distinct values), it is widened by ±3°F.
+        baseline_pmf = TempPMF.from_probs(lo, [1/N]*N) where N = hi - lo + 1.
+        baseline_metric = mean(crps_pmf(baseline_pmf, realized_max_d)) over window.
+        The model must beat an uninformed uniform-climatology baseline on CRPS to qualify.
+
+    PIT p-value (pit_uniform_pvalue):
+        pit_values = [pit_value(pmf_d, realized_max_d) for each paired day d]
+        p = scipy.stats.kstest(pit_values, "uniform").pvalue
+        If fewer than 5 PIT points: p = 0.0 (fail-closed — insufficient data
+        means the calibration check cannot be trusted; consistent with the
+        project's "if in doubt, don't trade" safety policy).
+
+    days:
+        Number of climate_dates with BOTH a stored prediction AND a stored
+        settlement (real coverage, not a stub count).
+
+    sim_pnl_usd:
+        Sum of realized_usd from all pnl rows in the trailing window.
+
+    max_drawdown_usd:
+        Maximum peak-to-trough drawdown of the cumulative pnl series.
+
+    fill_rate:
+        Placeholder 1.0 (held-to-settlement; fill records not yet persisted).
+        This is a known caveat (see settle_day docstring). Calibration criteria
+        are now real; fill_rate is not the gating factor.
+
+    insufficient data (no paired days) → fail-closed: GateResult(False, ...).
     """
     from kaiju.eval.gate import GateCriteria, evaluate_promotion, GateResult
+    from kaiju.eval.metrics import crps_pmf, pit_value
+    from kaiju.types import TempPMF
 
-    # Gather settled days: dates that have both a prediction and a pnl row.
+    # Gather settled days: dates that have a pnl row (mode-matched).
     pnl_rows = state.conn.execute(
         "SELECT climate_date, realized_usd FROM pnl WHERE mode=? ORDER BY climate_date",
         (mode,),
@@ -1035,28 +1102,57 @@ def _compute_gate(state: State, station: str, mode: str):
         return GateResult(False, "no settled days")
 
     pnl_by_date = {r[0]: r[1] for r in pnl_rows}
-    valid_dates = []
-    for cd in sorted(pnl_by_date.keys()):
-        if state.get_prediction(station, cd) is not None:
-            valid_dates.append(cd)
-
-    n_days = len(valid_dates)
     total_pnl = sum(pnl_by_date.values())
 
-    # PIT uniformity p-value.
-    # Without persisted realized_max, we cannot compute true PIT values.
-    # Use p=0.5 (neutral; does not fail the gate on this criterion alone).
-    # Task 20 must persist realized_max to enable real PIT computation.
-    pit_pvalue = 0.5
+    # Build paired (prediction, realized_max) window.
+    paired: list[tuple[TempPMF, int]] = []
+    for cd in sorted(pnl_by_date.keys()):
+        pred = state.get_prediction(station, cd)
+        if pred is None:
+            continue
+        sett = state.get_settlement(cd, station)
+        if sett is None:
+            continue
+        pmf = TempPMF.from_probs(pred["low_f"], pred["probs"])
+        paired.append((pmf, sett["realized_max"]))
 
-    # Brier (mean CRPS): 0.25 proxy (neutral baseline) until realized_max persisted.
-    mean_brier = 0.25
-    # Market baseline: uniform PMF CRPS ≈ 0.25 for a 1-wide PMF grid.
-    # With 0.25 brier and 0.25 baseline, brier < baseline is FALSE and gate fails.
-    # This is intentionally conservative when CRPS data is unavailable.
-    baseline_brier = 0.26  # slightly above 0.25 so gate is not artificially blocked
+    n_days = len(paired)
 
-    # Max drawdown: compute from sorted cumulative pnl series.
+    if n_days == 0:
+        return GateResult(False, "no days with both prediction and settlement")
+
+    # --- Real model CRPS ---
+    crps_values = [crps_pmf(pmf, rm) for pmf, rm in paired]
+    mean_brier = sum(crps_values) / len(crps_values)
+
+    # --- Uniform-climatology baseline CRPS ---
+    realized_maxes = [rm for _, rm in paired]
+    lo_range = min(realized_maxes)
+    hi_range = max(realized_maxes)
+    if hi_range - lo_range < 2:
+        # Degenerate range: widen by ±3°F so baseline PMF is non-trivial.
+        lo_range -= 3
+        hi_range += 3
+    n_bins = hi_range - lo_range + 1
+    baseline_pmf = TempPMF.from_probs(lo_range, [1.0 / n_bins] * n_bins)
+    baseline_crps_values = [crps_pmf(baseline_pmf, rm) for _, rm in paired]
+    baseline_brier = sum(baseline_crps_values) / len(baseline_crps_values)
+
+    # --- PIT uniformity p-value ---
+    pit_values = [pit_value(pmf, rm) for pmf, rm in paired]
+    _PIT_MIN_POINTS = 5
+    if len(pit_values) < _PIT_MIN_POINTS:
+        # Fail-closed: insufficient data to assess calibration; do not qualify.
+        pit_pvalue = 0.0
+    else:
+        try:
+            from scipy.stats import kstest as _kstest
+            pit_pvalue = float(_kstest(pit_values, "uniform").pvalue)
+        except ImportError:
+            # scipy not available; fall back to fail-closed (conservative).
+            pit_pvalue = 0.0
+
+    # --- PnL / drawdown ---
     pnl_series = [pnl_by_date.get(d, 0.0) for d in sorted(pnl_by_date.keys())]
     max_drawdown = _max_drawdown(pnl_series)
 

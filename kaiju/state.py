@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS working_orders(
 CREATE TABLE IF NOT EXISTS calibration(
   station TEXT PRIMARY KEY, bias REAL, spread_scale REAL, n INT,
   updated_at TEXT DEFAULT (datetime('now')));
+CREATE TABLE IF NOT EXISTS settlements(
+  climate_date TEXT, station TEXT, realized_max INT, mode TEXT,
+  updated_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY(climate_date, station));
 """
 
 
@@ -177,6 +181,42 @@ class State:
             "SELECT * FROM calibration WHERE station=?", (station,)
         ).fetchone()
         return dict(r) if r else None
+
+    def record_settlement(
+        self, climate_date: str, station: str, realized_max: int, mode: str
+    ) -> None:
+        """Upsert a settlement row recording the official realized max for a climate_date.
+
+        Columns: climate_date + station (PK), realized_max, mode, updated_at.
+        Called by settle_day after official_daily_max is resolved (success path only).
+        The LookupError / not-ready path writes neither pnl, settlement, nor gate.
+        """
+        self.conn.execute(
+            "INSERT INTO settlements(climate_date, station, realized_max, mode)"
+            " VALUES(?,?,?,?)"
+            " ON CONFLICT(climate_date, station) DO UPDATE SET"
+            " realized_max=excluded.realized_max, mode=excluded.mode,"
+            " updated_at=datetime('now')",
+            (climate_date, station, realized_max, mode),
+        )
+        self.conn.commit()
+
+    def get_settlement(self, climate_date: str, station: str) -> Optional[dict]:
+        """Return the settlement row for (climate_date, station), or None if absent."""
+        r = self.conn.execute(
+            "SELECT * FROM settlements WHERE climate_date=? AND station=?",
+            (climate_date, station),
+        ).fetchone()
+        return dict(r) if r else None
+
+    def list_settlements(self) -> list[dict]:
+        """Return all settlement rows ordered by climate_date ascending."""
+        return [
+            dict(r)
+            for r in self.conn.execute(
+                "SELECT * FROM settlements ORDER BY climate_date"
+            ).fetchall()
+        ]
 
     def record_pnl(self, climate_date: str, realized_usd: float, mode: str) -> None:
         """Upsert a pnl row for the given climate_date.
