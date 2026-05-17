@@ -37,9 +37,10 @@ Authoritative WS contract: docs/superpowers/notes/kalshi-ws-contract.md
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ class WsClient:
         self,
         connect: Callable[[], Any],
         on_event: Callable[[dict], None],
-        on_connect_reconcile: Callable[[], None],
+        on_connect_reconcile: Callable[[], None | Awaitable[None]],
         *,
         subscribe_msgs: Optional[list[dict]] = None,
     ) -> None:
@@ -85,7 +86,9 @@ class WsClient:
                 envelope (sid, seq) and the inner msg merged together.
             on_connect_reconcile: Called once immediately after (re)connect, BEFORE
                 consuming messages. Use to fetch current state via REST so that
-                subsequent WS deltas can be applied correctly.
+                subsequent WS deltas can be applied correctly. May be sync (returns
+                None) or async (returns a coroutine / Awaitable[None]); if async, it
+                is properly awaited.
             subscribe_msgs: Optional list of subscribe message dicts to send
                 after connecting (in order). Each is JSON-serialized and sent.
         """
@@ -94,16 +97,21 @@ class WsClient:
         self._on_connect_reconcile = on_connect_reconcile
         self._subscribe_msgs = subscribe_msgs or []
         self._stopped = False
+        self._stop_event: asyncio.Event | None = None
 
     def stop(self) -> None:
         """Signal run_forever to exit after the current run_once completes."""
         self._stopped = True
+        if self._stop_event is not None:
+            self._stop_event.set()
 
     async def run_once(self) -> None:
         """Open one WS connection, reconcile, consume messages, close on stream end.
 
         1. Calls connect() to obtain the WS connection.
         2. Calls on_connect_reconcile() (before any messages — reconcile window).
+           Supports both sync and async callables: if on_connect_reconcile returns
+           a coroutine, it is awaited.
         3. Sends each subscribe_msg via ws.send().
         4. Async-iterates messages; JSON-decodes and normalizes each to a plain dict;
            calls on_event(evt) for each.
@@ -115,7 +123,9 @@ class WsClient:
         """
         ws = self._connect()
         try:
-            self._on_connect_reconcile()
+            result = self._on_connect_reconcile()
+            if inspect.iscoroutine(result):
+                await result
             for msg_dict in self._subscribe_msgs:
                 await ws.send(json.dumps(msg_dict))
             async for raw in ws:
@@ -135,18 +145,35 @@ class WsClient:
             max_backoff: Maximum reconnect delay in seconds (default 30.0).
                 Pass 0.0 in tests to skip actual sleep.
         """
+        # Lazy-init the stop event so it belongs to the running event loop.
+        self._stop_event = asyncio.Event()
+        if self._stopped:
+            self._stop_event.set()
+
         backoff = 0.1
         while not self._stopped:
             try:
                 await self.run_once()
-                # Clean stream end — reset backoff, reconnect unless stopped
+                # Clean stream end — reset backoff, reconnect unless stopped.
                 backoff = 0.1
             except Exception as exc:
                 if self._stopped:
                     break
-                logger.warning("WsClient connection error, reconnecting in %.1fs: %s", backoff, exc)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+                logger.warning(
+                    "WsClient connection error, reconnecting in %.1fs: %s",
+                    backoff,
+                    exc,
+                )
+                # Interruptible backoff sleep: returns early if stop() is called.
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass  # Backoff elapsed normally — continue reconnecting.
+                if self._stopped:
+                    break
+                # Grow backoff AFTER the wait so first retry uses the current value,
+                # then subsequent retries use the doubled value (capped at max_backoff).
+                backoff = min(max(backoff * 2, 0.1), max_backoff)
 
 
 def _normalize_event(envelope: dict) -> dict:
@@ -200,7 +227,7 @@ def make_kalshi_ws_connect(
 
     UNVERIFIED (Task 17 to confirm):
         - Server accepts "/trade-api/ws/v2" as the signed path (not full URL).
-        - websockets 12+ connect API with extra_headers kwarg works as expected.
+        - websockets 12+ connect API with additional_headers kwarg works as expected.
     """
     # Heavy import (websockets) is deferred to _WsConnectionWrapper._ensure_connected —
     # offline tests/mypy do not need it installed.
@@ -215,7 +242,7 @@ def make_kalshi_ws_connect(
     def _connect() -> Any:
         timestamp_ms = int(time.time() * 1000)
         sig, ts = sign_request(private_key_pem, "GET", WS_SIGNING_PATH, timestamp_ms)
-        extra_headers = {
+        additional_headers = {
             "KALSHI-ACCESS-KEY": key_id,
             "KALSHI-ACCESS-SIGNATURE": sig,
             "KALSHI-ACCESS-TIMESTAMP": ts,
@@ -225,7 +252,7 @@ def make_kalshi_ws_connect(
         # that opens the connection and yields it.
         return _WsConnectionWrapper(
             base_ws_url,
-            extra_headers=extra_headers,
+            additional_headers=additional_headers,
             market_tickers=market_tickers,
         )
 
@@ -238,14 +265,14 @@ class _WsConnectionWrapper:
     Exposes: send(), async iteration of messages, close().
     Opens the connection lazily on first use (via __aiter__ or send).
 
-    UNVERIFIED: websockets 12+ connect() with extra_headers kwarg confirmed
+    UNVERIFIED: websockets 12+ connect() with additional_headers kwarg confirmed
     in websockets docs for HTTP headers during the WS handshake upgrade request.
     Task 17 live demo will confirm the full auth flow.
     """
 
-    def __init__(self, url: str, extra_headers: dict, market_tickers: list[str]) -> None:
+    def __init__(self, url: str, additional_headers: dict, market_tickers: list[str]) -> None:
         self._url = url
-        self._extra_headers = extra_headers
+        self._additional_headers = additional_headers
         self._market_tickers = market_tickers
         self._ws: Any = None
         self._iter: Any = None
@@ -255,7 +282,7 @@ class _WsConnectionWrapper:
             import websockets  # type: ignore[import]
             self._ws = await websockets.connect(
                 self._url,
-                additional_headers=self._extra_headers,
+                additional_headers=self._additional_headers,
             )
 
     async def send(self, m: str) -> None:
@@ -267,10 +294,18 @@ class _WsConnectionWrapper:
 
     async def __anext__(self) -> str:
         await self._ensure_connected()
+        import websockets  # type: ignore[import]
         try:
             return await self._ws.recv()
-        except Exception:
+        except websockets.exceptions.ConnectionClosedOK:
             raise StopAsyncIteration
+        except websockets.exceptions.ConnectionClosed as exc:
+            # code == 1000 is also a clean close (normal closure).
+            if exc.rcvd is not None and exc.rcvd.code == 1000:
+                raise StopAsyncIteration
+            # Any other connection-closed code (auth failure, server error, etc.)
+            # must propagate so run_forever can log and back off.
+            raise
 
     async def close(self) -> None:
         if self._ws is not None:

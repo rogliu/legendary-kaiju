@@ -19,6 +19,7 @@ so on_event receives: {"type": "...", "sid": N, "seq": N, <msg fields...>}
 
 import asyncio
 import json
+import logging
 
 from kaiju.markets.ws_client import WsClient
 
@@ -211,3 +212,265 @@ def test_run_forever_reconnects_on_exception():
     asyncio.run(c.run_forever(max_backoff=0.0))
     # Should have connected at least twice (reconnect after error)
     assert call_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# New tests for reliability fixes (Fix 1–5)
+# ---------------------------------------------------------------------------
+
+
+class AlwaysErrorWS:
+    """Fake WS transport that always raises a non-clean error on iteration."""
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        self._exc = exc or ConnectionError("simulated auth failure")
+
+    async def send(self, m: str) -> None:
+        pass
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> str:
+        raise self._exc
+
+    async def close(self) -> None:
+        pass
+
+
+def test_persistent_failure_logs_and_grows_backoff_not_tight_loop(caplog):
+    """Fix 1: persistent non-clean errors are logged and produce growing backoff.
+
+    A transport that always raises a real error must:
+    (a) produce WARNING/ERROR log messages containing the error text,
+    (b) grow the backoff across attempts (non-decreasing, not constant 0.1),
+    (c) not treat the error as a clean stream end (i.e. backoff path, not reset path).
+    """
+    connect_count = 0
+    sleep_durations: list[float] = []
+
+    async def fake_wait_for(coro, *, timeout: float) -> None:
+        """Monkeypatched stand-in: record the timeout, immediately time-out (no sleep)."""
+        sleep_durations.append(timeout)
+        # Cancel the coro we were given so it does not linger.
+        coro.close()
+        raise asyncio.TimeoutError
+
+    def make_ws():
+        nonlocal connect_count
+        connect_count += 1
+        if connect_count >= 4:
+            c.stop()
+        return AlwaysErrorWS(ConnectionError("simulated auth failure"))
+
+    c = WsClient(
+        connect=make_ws,
+        on_event=lambda e: None,
+        on_connect_reconcile=lambda: None,
+    )
+
+    # Patch asyncio.wait_for inside ws_client so the test is instant.
+    import kaiju.markets.ws_client as ws_mod
+    original_wait_for = asyncio.wait_for
+    try:
+        ws_mod.asyncio.wait_for = fake_wait_for  # type: ignore[attr-defined]
+        with caplog.at_level(logging.WARNING, logger="kaiju.markets.ws_client"):
+            asyncio.run(c.run_forever(max_backoff=32.0))
+    finally:
+        ws_mod.asyncio.wait_for = original_wait_for
+
+    # (a) Error text appeared in logs at WARNING or ERROR level.
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("simulated auth failure" in r.getMessage() for r in warning_records), (
+        "Expected the connection error to be logged at WARNING/ERROR level"
+    )
+
+    # (b) Backoff grew across attempts — sequence must be non-decreasing and
+    #     must NOT be all equal to 0.1 (that would be the tight-loop / reset bug).
+    assert len(sleep_durations) >= 2, "Expected multiple backoff sleeps"
+    assert sleep_durations == sorted(sleep_durations), (
+        f"Backoff must be non-decreasing, got {sleep_durations}"
+    )
+    assert not all(d == sleep_durations[0] for d in sleep_durations), (
+        f"Backoff must grow across retries, got constant {sleep_durations}"
+    )
+
+    # (c) We connected at least 3 times (error path, not clean-end reset path).
+    assert connect_count >= 3
+
+
+def test_clean_close_is_stream_end_not_error(caplog):
+    """Fix 1: a clean stream-end (StopAsyncIteration) does NOT log an error and resets backoff.
+
+    Uses FakeWS which raises StopAsyncIteration on empty — the canonical clean close.
+    run_forever should return after stop() without emitting any WARNING/ERROR.
+    """
+    call_count = 0
+
+    def make_ws():
+        nonlocal call_count
+        call_count += 1
+        c.stop()  # stop after first clean connect
+        return FakeWS([])  # empty → immediate StopAsyncIteration → clean end
+
+    c = WsClient(
+        connect=make_ws,
+        on_event=lambda e: None,
+        on_connect_reconcile=lambda: None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="kaiju.markets.ws_client"):
+        asyncio.run(c.run_forever(max_backoff=0.0))
+
+    # Clean close must NOT produce any warning/error log.
+    warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning_records == [], (
+        f"Clean stream end should not log at WARNING/ERROR, got: {warning_records}"
+    )
+    assert call_count == 1
+
+
+def test_reconcile_awaited_when_async():
+    """Fix 2: an async on_connect_reconcile is properly awaited.
+
+    Passing an async def reconcile that increments a counter; after run_once
+    the counter must be 1 (proves it was awaited, not silently skipped).
+    """
+    reconcile_count = 0
+
+    async def async_reconcile() -> None:
+        nonlocal reconcile_count
+        reconcile_count += 1
+
+    fake = FakeWS([])
+    c = WsClient(
+        connect=lambda: fake,
+        on_event=lambda e: None,
+        on_connect_reconcile=async_reconcile,
+    )
+    asyncio.run(c.run_once())
+    assert reconcile_count == 1, (
+        f"Expected async reconcile to be awaited once, got {reconcile_count}"
+    )
+
+
+def test_reconcile_sync_still_works():
+    """Fix 2 regression: sync on_connect_reconcile still works after the async-await fix."""
+    reconcile_count = 0
+
+    def sync_reconcile() -> None:
+        nonlocal reconcile_count
+        reconcile_count += 1
+
+    fake = FakeWS([])
+    c = WsClient(
+        connect=lambda: fake,
+        on_event=lambda e: None,
+        on_connect_reconcile=sync_reconcile,
+    )
+    asyncio.run(c.run_once())
+    assert reconcile_count == 1
+
+
+def test_reconcile_called_on_every_reconnect():
+    """Fix 2: async reconcile is called on EACH reconnect, not just the first.
+
+    3-connect scenario: first two raises an error (triggering reconnect), third stops.
+    Reconcile count must equal connect count (3).
+    """
+    connect_count = 0
+    reconcile_count = 0
+
+    async def async_reconcile() -> None:
+        nonlocal reconcile_count
+        reconcile_count += 1
+
+    class OneErrorWS:
+        """Raises error on first __anext__ call."""
+        async def send(self, m: str) -> None:
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            raise ConnectionError("deliberate failure")
+
+        async def close(self) -> None:
+            pass
+
+    def make_ws():
+        nonlocal connect_count
+        connect_count += 1
+        if connect_count >= 3:
+            c.stop()
+            return FakeWS([])  # clean exit on 3rd connect
+        return OneErrorWS()
+
+    c = WsClient(
+        connect=make_ws,
+        on_event=lambda e: None,
+        on_connect_reconcile=async_reconcile,
+    )
+    asyncio.run(c.run_forever(max_backoff=0.0))
+
+    assert connect_count == 3, f"Expected 3 connects, got {connect_count}"
+    assert reconcile_count == connect_count, (
+        f"reconcile ({reconcile_count}) must equal connect count ({connect_count})"
+    )
+
+
+def test_stop_interrupts_backoff_sleep_promptly():
+    """Fix 3: calling stop() during the backoff wait causes run_forever to exit promptly.
+
+    With a large max_backoff (30s), we trigger one error (so the bot enters the backoff
+    sleep), then call stop() from a concurrent task. run_forever must return well under
+    max_backoff (< 0.5s wall time).
+    """
+    import time
+
+    class OneErrorWS:
+        async def send(self, m: str) -> None:
+            pass
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            raise ConnectionError("trigger backoff")
+
+        async def close(self) -> None:
+            pass
+
+    connect_count = 0
+
+    def make_ws():
+        nonlocal connect_count
+        connect_count += 1
+        return OneErrorWS()
+
+    async def run_test() -> float:
+        c = WsClient(
+            connect=make_ws,
+            on_event=lambda e: None,
+            on_connect_reconcile=lambda: None,
+        )
+
+        async def stopper():
+            # Wait for the first error log (run_once to have failed once), then stop.
+            # We use a tiny sleep to let run_forever enter its wait_for backoff.
+            await asyncio.sleep(0.05)
+            c.stop()
+
+        start = time.monotonic()
+        await asyncio.gather(
+            c.run_forever(max_backoff=30.0),
+            stopper(),
+        )
+        return time.monotonic() - start
+
+    elapsed = asyncio.run(run_test())
+    assert elapsed < 0.5, (
+        f"run_forever should exit promptly when stop() is called during backoff, "
+        f"but took {elapsed:.2f}s (max_backoff=30.0)"
+    )
