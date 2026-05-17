@@ -249,3 +249,138 @@ NWS issues the Daily Climate Report (CLI) typically the morning after the climat
 7. **Series `HIGHNY0` and `HIGHNY`**: Two additional tickers found in the series scan (`HIGHNY0` — "NYC high temperature", cat=World; `HIGHNY` — "Highest temperature in NYC") appear to be older or duplicate series. Only `KXHIGHNY` was verified with live events and market data in 2026. Task 20 should confirm which ticker is active before trading.
 
 8. **Task 19/20 live demo confirmation needed**: The cross-check was performed on one settled date (May 14, 2026). A production-readiness check should verify IEM matches Kalshi `expiration_value` for at least 5 consecutive settled days before going live.
+
+---
+
+## IEM intraday ASOS (Task 10 SPIKE)
+
+**Retrieval date: 2026-05-17**
+
+### Verified Endpoint
+
+```
+GET https://mesonet.agron.iastate.edu/api/1/obhistory.json
+```
+
+**Query parameters:**
+
+| Parameter | Type   | Required | Notes                                                        |
+|-----------|--------|----------|--------------------------------------------------------------|
+| `station` | string | Yes      | ASOS station identifier — `NYC` for Central Park            |
+| `network` | string | Yes      | IEM network — `NY_ASOS`                                     |
+| `date`    | string | Yes      | Calendar date `YYYY-MM-DD` (local station time)             |
+
+**Example:**
+
+```
+GET https://mesonet.agron.iastate.edu/api/1/obhistory.json?station=NYC&network=NY_ASOS&date=2026-05-14
+```
+
+### JSON Path to Per-Observation Air Temperature
+
+```
+response.data[*].tmpf
+```
+
+- **Type:** number (float °F) or `null`
+- **Units:** °F
+- **Timestamps:** `data[*].local_valid` — ISO-style local datetime `YYYY-MM-DDTHH:MM` (no tz suffix; station local time = `America/New_York`)
+- **UTC timestamp also available:** `data[*].utc_valid` — ISO string with `Z` suffix
+
+**Null behaviour:** `tmpf` is `null` for observations where the temperature sensor was not reporting. No string `'M'` sentinel was observed in this endpoint (unlike the older `asos.py` CSV endpoint which uses `'M'` for missing). Always check `isinstance(v, (int, float))` or `v is not None` before using.
+
+### Station Identification
+
+| Field       | Value                               |
+|-------------|-------------------------------------|
+| IEM Station | `NYC`                               |
+| IEM Network | `NY_ASOS`                           |
+| Human name  | `NEW YORK CITY` (IEM ASOS label)    |
+| ncdc81      | `USW00094728`                       |
+| WFO         | `OKX`                               |
+| METAR ID    | `KNYC` (appears in raw METAR field) |
+| Archive     | 1943-12-01 to present               |
+
+**Same station as NYCLIMATE `NYTNYC`:** Both `NYC` (NY_ASOS) and `NYTNYC` (NYCLIMATE) share `ncdc81=USW00094728`. The ASOS sub-hourly observations are the underlying source for the daily climate summary.
+
+**Verified:** `NYC` returns per-hour `tmpf` for 2026-05-14. The `raw` field confirms METAR identifier `KNYC`. Running max across all 24 observations = 65°F. The official daily max from NYCLIMATE (`max_tmpf=66`) exceeds the ASOS running max (65°F) for the same date — consistent with the NWS CLI report incorporating the warmest reading during the climate day window including any afternoon peak not captured on-the-hour.
+
+### How to Compute Running Max So Far for a Date/Time
+
+```python
+import httpx
+
+def observed_max_so_far(station: str, date: str) -> int:
+    url = "https://mesonet.agron.iastate.edu/api/1/obhistory.json"
+    r = httpx.get(url, params={"station": station, "network": "NY_ASOS", "date": date}, timeout=20)
+    r.raise_for_status()
+    obs = r.json()["data"]
+    valid = [o["tmpf"] for o in obs if isinstance(o.get("tmpf"), (int, float))]
+    if not valid:
+        raise LookupError(f"No valid tmpf observations for {station} on {date}")
+    return int(round(max(valid)))
+```
+
+To get the running max *up to a specific time*, filter on `local_valid <= cutoff_time` before computing the max.
+
+### Response Shape
+
+```json
+{
+  "schema": {
+    "fields": [
+      {"name": "index", "type": "integer"},
+      {"name": "utc_valid", "type": "string"},
+      {"name": "local_valid", "type": "string"},
+      {"name": "tmpf", "type": "number"},
+      ...
+    ],
+    "primaryKey": ["index"]
+  },
+  "data": [
+    {
+      "index": 0,
+      "utc_valid": "2026-05-14T04:51Z",
+      "local_valid": "2026-05-14T00:51",
+      "tmpf": 57.0,
+      "dwpf": 51.0,
+      ...
+    },
+    ...
+  ]
+}
+```
+
+### Fixture Location
+
+Fixture file: `tests/fixtures/iem_knyc_asos.json`
+
+- Contains 24 observations: 2026-05-14 00:51 through 23:51 (America/New_York).
+- Top-level keys: `"schema"` and `"data"`.
+- 24 rows, one per hour (at :51 minutes past each hour — ASOS observation time).
+- `tmpf` range: 55.0–65.0 °F; `int(round(max)) = 65`.
+- No null `tmpf` values in this fixture.
+
+### Mock-Matching Guidance for Task 10 Tests
+
+```python
+import respx, httpx
+
+respx.get(url__regex=r".*mesonet\.agron\.iastate\.edu.*").mock(
+    return_value=httpx.Response(200, json=fixture_data)
+)
+```
+
+Or more specific:
+```python
+respx.get("https://mesonet.agron.iastate.edu/api/1/obhistory.json")
+```
+
+### Quirks
+
+1. **Null `tmpf`:** Use `isinstance(v, (int, float))` or `v is not None` to filter. No string `'M'` sentinels observed in this JSON endpoint.
+2. **`local_valid` format:** `YYYY-MM-DDTHH:MM` — no seconds, no timezone suffix. Parse with `datetime.fromisoformat` (works in Python 3.12).
+3. **Observation cadence:** Roughly hourly at :51 past the hour (METAR_RESET_MINUTE=51 per IEM station metadata). May have gaps or special obs.
+4. **Running max vs official max:** The ASOS running max (65°F on 2026-05-14) may be 1°F below the official NYCLIMATE daily max (66°F) because the official CLI value incorporates all NWS readings including any special observations between scheduled METAR times. Do not use the ASOS running max as a settlement proxy — use it only for intraday nowcasting.
+5. **Intraday endpoint returns full-day data:** The API always returns all observations for the given date up to the current time. For a date in the past it returns the full day; for today it returns observations through the current hour.
+6. **'M' values (legacy note):** The older `asos.py` CSV endpoint at `/cgi-bin/request/asos.py` uses `'M'` for missing values. The `obhistory.json` endpoint uses `null` instead. This implementation uses `obhistory.json` exclusively.
