@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal, Optional
 import numpy as np
 
@@ -88,3 +89,25 @@ class RiskDecision:
     approved: bool
     reason: str
     adjusted_count: int
+
+
+class ExitAction(Enum):
+    HOLD = "hold"
+    EXIT = "exit"      # close via limit at limit_price_cents
+    CUT = "cut"        # thesis invalidated; close now
+
+
+@dataclass(frozen=True)
+class Position:
+    market_ticker: str
+    side: Literal["yes", "no"]
+    count: int
+    avg_entry_cents: int
+    climate_date: str
+
+
+@dataclass(frozen=True)
+class ExitDecision:
+    action: ExitAction
+    limit_price_cents: Optional[int]
+    reason: str
