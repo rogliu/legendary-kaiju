@@ -156,6 +156,36 @@ def test_resolve_settlement_knyc():
     assert s["station_human"] == "Central Park, New York"
 
 
+def test_resolve_settlement_kxhighny_contains_asos_identifiers():
+    """Fix B seam test: resolve_settlement must expose both identifier pairs.
+
+    The CRITICAL property: if someone reverts asos_station to the settlement
+    iem_station ('NYTNYC'), the nowcast call would query the wrong IEM endpoint
+    and return no rows. This test catches that regression immediately.
+
+    Both identifier pairs must be present AND distinct:
+      settlement: iem_station='NYTNYC', iem_network='NYCLIMATE'
+      nowcast:    asos_station='NYC',    asos_network='NY_ASOS'
+    """
+    s = resolve_settlement("KXHIGHNY")
+    # ASOS identifiers (for intraday nowcast via observed_max_so_far)
+    assert s["asos_station"] == "NYC", (
+        f"asos_station must be 'NYC' (NY_ASOS station), got {s['asos_station']!r}. "
+        "Regressing to iem_station='NYTNYC' here would silently break the nowcast."
+    )
+    assert s["asos_network"] == "NY_ASOS", (
+        f"asos_network must be 'NY_ASOS', got {s['asos_network']!r}."
+    )
+    # Settlement identifiers (for official_daily_max via IEM NYCLIMATE)
+    assert s["iem_station"] == "NYTNYC", "iem_station must still be 'NYTNYC' (settlement)"
+    assert s["iem_network"] == "NYCLIMATE", "iem_network must still be 'NYCLIMATE' (settlement)"
+    # The two station identifiers must be DIFFERENT (that's the whole hazard)
+    assert s["asos_station"] != s["iem_station"], (
+        "asos_station and iem_station must differ — they are distinct IEM identifiers "
+        "for the same physical site. If they match, the nowcast is broken."
+    )
+
+
 def test_resolve_settlement_unknown_raises():
     with pytest.raises((KeyError, ValueError)):
         resolve_settlement("KXUNKNOWN")

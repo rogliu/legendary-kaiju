@@ -63,7 +63,7 @@ class IEMClient:
 
         raise LookupError(f"No daily data row found for station={station} date={date}")
 
-    def observed_max_so_far(self, station: str, date: str) -> int:
+    def observed_max_so_far(self, station: str, date: str, *, network: str = "NY_ASOS") -> int:
         """Return the running maximum of intraday ASOS tmpf observations for the given date.
 
         Queries the IEM ASOS observation history endpoint (NY_ASOS network for NYC).
@@ -71,7 +71,14 @@ class IEMClient:
 
         Args:
             station: ASOS station identifier, e.g. "NYC" for Central Park.
+                     NOTE: for NYC/KXHIGHNY this is "NYC" (NY_ASOS), NOT "NYTNYC"
+                     (NYCLIMATE). The caller must pass the asos_station from
+                     resolve_settlement(), not the iem_station. See settlement-map.md
+                     §IEM intraday ASOS for the verified station identifiers.
             date: Calendar date in "YYYY-MM-DD" format (local station time).
+            network: IEM network identifier (keyword-only, default "NY_ASOS").
+                     Pass resolve_settlement()["asos_network"] for forward compatibility
+                     when multi-city support is added.
 
         Returns:
             Running maximum observed temperature as an integer °F.
@@ -87,7 +94,7 @@ class IEMClient:
         with httpx.Client(timeout=_TIMEOUT) as client:
             response = client.get(
                 _ASOS_BASE_URL,
-                params={"station": station, "network": "NY_ASOS", "date": date},
+                params={"station": station, "network": network, "date": date},
             )
             response.raise_for_status()
             try:

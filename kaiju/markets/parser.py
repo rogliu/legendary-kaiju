@@ -55,8 +55,16 @@ from kaiju.types import Bucket, EventSnapshot, MarketQuote
 _SETTLEMENT_MAP: dict[str, dict[str, str]] = {
     "KXHIGHNY": {
         "station_human": "Central Park, New York",
+        # Settlement daily-max identifiers (IEM NYCLIMATE archive, final NWS CLI value):
         "iem_station": "NYTNYC",
         "iem_network": "NYCLIMATE",
+        # Intraday ASOS identifiers (IEM obhistory.json, NY_ASOS sub-hourly obs):
+        # HAZARD: these are DIFFERENT IEM identifiers for the same physical site.
+        # Settlement must use NYTNYC/NYCLIMATE; nowcast MUST use NYC/NY_ASOS.
+        # See docs/superpowers/notes/settlement-map.md §IEM intraday ASOS — ASOS station
+        # section, which explicitly flags this two-identifier hazard for Central Park.
+        "asos_station": "NYC",
+        "asos_network": "NY_ASOS",
         "tz": "America/New_York",
     },
 }
@@ -65,7 +73,16 @@ _SETTLEMENT_MAP: dict[str, dict[str, str]] = {
 def resolve_settlement(series_ticker: str) -> dict[str, str]:
     """Return settlement metadata for a Kalshi series ticker.
 
-    Keys returned: station_human, iem_station, iem_network, tz.
+    Keys returned: station_human, iem_station, iem_network, asos_station, asos_network, tz.
+
+    Two distinct IEM identifier pairs are provided for the same physical site:
+      - Settlement daily-max uses iem_station/iem_network (e.g. NYTNYC/NYCLIMATE).
+        Call IEMClient.official_daily_max(iem_station, iem_network, date).
+      - Intraday nowcast ASOS uses asos_station/asos_network (e.g. NYC/NY_ASOS).
+        Call IEMClient.observed_max_so_far(asos_station, date) with network=asos_network.
+    HAZARD (settlement-map.md §6): the NWS CLI issuedby code 'NYC' and the ASOS station
+    'NYC' are the same string but DIFFERENT from the NYCLIMATE station 'NYTNYC'. Do not
+    pass the settlement iem_station to the ASOS nowcast query — it will return no rows.
 
     Raises KeyError with a clear message for unmapped series.
     Does NOT guess — only hard-verified entries are in the map.

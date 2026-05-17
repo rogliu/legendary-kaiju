@@ -226,7 +226,10 @@ item below before setting `KAIJU_MODE=live`.
 
 - [ ] **Paper-proof gate shows `qualified`.** The gate SQLite row has
   `status="qualified"`. Do not skip this — the gate thresholds are the
-  agreed objective criterion.
+  agreed objective criterion. This is now **programmatically enforced**:
+  `run_intraday` calls `can_trade_live(qualified, armed)` before the trading
+  loop; if the gate is not qualified or the arm token is missing, the runner
+  raises `SystemExit` and refuses to place any live orders (fail-closed).
 
 - [ ] **Daily-loss limit is active.** `KAIJU_MAX_DAILY_LOSS_USD` is set to a
   value you are willing to lose in a single day. The runner logs an `ERROR`
@@ -412,11 +415,17 @@ gate computation (held-to-settlement positions are "filled by definition").
 The `min_fill_rate = 0.20` gate threshold exists in the criteria but is
 currently always passed. Real fill rate from limit-order execution is unknown.
 
-**3. Multi-city not supported.**
-v1 is single-city only. `observed_max_so_far` hardcodes IEM network `NY_ASOS`
-and station `NYC`. `resolve_settlement` maps only `KXHIGHNY` to IEM
-coordinates. Passing any station other than `NYC` or `KNYC` to `run` will raise
-`KeyError` loudly — intentional.
+**3. Multi-city not supported; two distinct IEM identifiers for the same site.**
+v1 is single-city only (`NYC`/`KXHIGHNY`). `resolve_settlement` maps only
+`KXHIGHNY`. Passing any station other than `NYC` or `KNYC` to `run` raises
+`KeyError` loudly — intentional. Additionally, the Central Park site uses two
+different IEM identifier pairs: settlement queries the NYCLIMATE archive
+(`iem_station=NYTNYC`, `iem_network=NYCLIMATE`) while intraday nowcast queries
+the ASOS observation history (`asos_station=NYC`, `asos_network=NY_ASOS`). These
+are distinct identifiers for the same physical station (`ncdc81=USW00094728`).
+The runner now correctly routes each query to the right identifier pair via
+`resolve_settlement`. `observed_max_so_far` defaults `network="NY_ASOS"` and
+must be called with `asos_station` (not `iem_station`).
 
 **4. WS `orderbook_delta` is snapshot-only.**
 The WS client receives `orderbook_delta` messages but applies them as full

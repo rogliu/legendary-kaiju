@@ -348,8 +348,12 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
     # For NYC the series is KXHIGHNY.
     series_ticker = _station_to_series(station)
     settlement = resolve_settlement(series_ticker)
-    iem_station = settlement["iem_station"]
-    # iem_network reserved for future official_daily_max calls in Task 18 settle path
+    iem_station = settlement["iem_station"]        # NYTNYC — settlement daily-max only
+    # asos_station/asos_network for intraday nowcast (DIFFERENT from iem_station).
+    # HAZARD: observed_max_so_far uses NY_ASOS/NYC, NOT NYCLIMATE/NYTNYC.
+    # See settlement-map.md §IEM intraday ASOS and resolve_settlement() docstring.
+    asos_station = settlement["asos_station"]      # NYC — ASOS obhistory.json
+    asos_network = settlement["asos_network"]      # NY_ASOS
 
     # --- Build clients ---
     kalshi = KalshiClient(
@@ -434,8 +438,13 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
             base = apply_calibration(base, cal)
 
         # Nowcast: observed max so far (contract 6 — LookupError vs httpx split).
+        # HAZARD: must use asos_station (NYC) + asos_network (NY_ASOS) here, NOT
+        # iem_station (NYTNYC) + iem_network (NYCLIMATE). The ASOS obhistory.json
+        # endpoint requires the NY_ASOS station identifier; NYTNYC is NYCLIMATE-only.
+        # Passing iem_station here returns no rows → LookupError → nowcast never runs.
+        # See settlement-map.md §IEM intraday ASOS (NYTNYC-vs-NYC hazard).
         try:
-            obs_max = iem.observed_max_so_far(iem_station, climate_date)
+            obs_max = iem.observed_max_so_far(asos_station, climate_date, network=asos_network)
         except LookupError as exc:
             log.info("IEM observed_max not ready: %s", exc)
             obs_max = None
@@ -537,6 +546,32 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
         on_event=_on_ws_event,
         on_connect_reconcile=pm.reconcile,  # async def — contract 2
     )
+
+    # --- Live safety interlock (Fix D): can_trade_live hard gate ---
+    # can_trade_live(qualified, armed) is the programmatic belt-and-suspenders check
+    # that the paper-proof gate is qualified AND the live arm token is set. This
+    # supplements the config-level _live_guard validator (which only checks the token).
+    # The gate must be QUALIFIED (settle_day has populated a "qualified" status row)
+    # AND the arm token must be non-empty for live trading to proceed.
+    # Applies ONLY when mode=="live"; shadow-paper/backtest are unaffected.
+    if mode == "live":
+        from kaiju.eval.gate import can_trade_live
+        gate_status = state.get_gate_status()
+        is_qualified = (
+            gate_status is not None and gate_status.get("status") == "qualified"
+        )
+        is_armed = cfg.live_armed
+        if not can_trade_live(qualified=is_qualified, armed=is_armed):
+            log.error(
+                "UNSAFE: live mode but gate not qualified and/or not armed — "
+                "refusing to place live orders. Run settle_day + retrain to "
+                "accumulate qualified gate status before going live."
+            )
+            raise SystemExit(
+                "Live trading refused: can_trade_live returned False "
+                f"(qualified={is_qualified}, armed={is_armed}). "
+                "Gate must be 'qualified' and KAIJU_LIVE_ARM_TOKEN must be set."
+            )
 
     # Fix #5: construct RiskGate ONCE before the loop (params are frozen from cfg).
     gate = RiskGate(
