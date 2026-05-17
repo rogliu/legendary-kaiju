@@ -16,3 +16,23 @@ def test_fails_on_negative_pnl_or_low_fill_or_few_days():
     assert evaluate_promotion(30, 0.16, 0.20, 0.4, -1.0, 25, 8.0, 0.6, c).qualified is False
     assert evaluate_promotion(30, 0.16, 0.20, 0.4, 18.0, 25, 8.0, 0.05, c).qualified is False
     assert evaluate_promotion(5, 0.16, 0.20, 0.4, 18.0, 25, 8.0, 0.6, c).qualified is False
+
+
+def test_gate_fails_closed_on_non_finite_metric():
+    c = GateCriteria()
+    r = evaluate_promotion(30, float("nan"), 0.20, 0.4, 18.0, 25, 8.0, 0.6, c)
+    assert r.qualified is False and "non-finite" in r.reason
+    r2 = evaluate_promotion(30, 0.16, 0.20, 0.4, float("inf"), 25, 8.0, 0.6, c)
+    assert r2.qualified is False and "non-finite" in r2.reason
+
+def test_gate_boundaries_at_threshold():
+    c = GateCriteria()
+    # at-threshold PASSES: days==30, trades==15, drawdown==25.0, fill==0.20
+    assert evaluate_promotion(30, 0.16, 0.20, 0.4, 1.0, 15, 25.0, 0.20, c).qualified is True
+    # brier == baseline FAILS (strict improvement required)
+    assert evaluate_promotion(30, 0.20, 0.20, 0.4, 1.0, 25, 8.0, 0.6, c).qualified is False
+    # pnl == 0 FAILS (non-positive)
+    assert evaluate_promotion(30, 0.16, 0.20, 0.4, 0.0, 25, 8.0, 0.6, c).qualified is False
+
+def test_can_trade_live_false_false():
+    assert can_trade_live(False, False) is False

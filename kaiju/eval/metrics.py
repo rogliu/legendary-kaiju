@@ -10,6 +10,13 @@ def brier_score(probs, outcomes) -> float:
 
 
 def crps_pmf(pmf: TempPMF, observed: int) -> float:
+    """Standard discrete CRPS on the PMF's bounded integer grid (unit 1°F bins).
+
+    If *observed* is OUTSIDE [low_f, high_f] the score SATURATES: it reflects
+    "outside support" but not the magnitude of how far beyond the grid the
+    observation fell.  Callers feeding monitoring pipelines should be aware that
+    two very different out-of-support observations produce the same score.
+    """
     temps = np.arange(pmf.low_f, pmf.high_f + 1)
     cdf = np.cumsum(pmf.probs)
     h = (temps >= observed).astype(float)
@@ -17,6 +24,9 @@ def crps_pmf(pmf: TempPMF, observed: int) -> float:
 
 
 def pit_value(pmf: TempPMF, observed: int) -> float:
+    # Uses right-endpoint CDF P(X<=obs) — non-randomized discrete PIT.
+    # Intentionally super-uniform under a correct model; still flags miscalibration.
+    # Do NOT "fix" to a randomized PIT without careful review of downstream tests.
     return float(pmf.prob_interval(None, observed))
 
 
