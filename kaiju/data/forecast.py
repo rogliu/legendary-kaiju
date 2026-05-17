@@ -13,6 +13,8 @@ Cross-task contract (used by runner Task 17):
   gefs_members_from_fixture(path: str)    -> list[float]
   fetch_nbm_percentiles(lat: float, lon: float, run: datetime, fxx: int = 30) -> dict[float, float]
   fetch_gefs_members(lat: float, lon: float, run: datetime) -> list[float]
+
+Note: lon MUST be in [0,360] (0-360 grid; pass lon+360 for western longitudes).
 """
 
 from __future__ import annotations
@@ -76,10 +78,20 @@ def fetch_nbm_percentiles(
     Grid extraction: scipy cKDTree nearest on curvilinear NBM grid.
     Units: Kelvin → °F.
 
+    lon MUST be in [0,360] (0-360 grid; pass lon+360 for western longitudes).
+
     Returns:
         dict mapping float percentile (0..100, step 5) to float °F.
         Missing percentile levels are skipped (not fabricated).
+        Raises RuntimeError if fewer than 15 levels are returned (likely a
+        network/auth failure, not genuine sparsity).
     """
+    if not (0.0 <= lon <= 360.0):
+        raise ValueError(
+            f"lon must be in [0,360] (0-360 grid convention); got {lon}. "
+            f"For W longitudes pass lon+360 (e.g. KNYC -73.9693 -> 286.0307)."
+        )
+
     import numpy as np
     from herbie import Herbie
     from scipy.spatial import cKDTree
@@ -88,6 +100,13 @@ def fetch_nbm_percentiles(
     H = Herbie(run_str, model="nbmqmd", product="co", fxx=fxx, priority="aws")
 
     results: dict[float, float] = {}
+    # KDTree and nearest-point index are built once from the first successful level
+    # and reused across all remaining levels (NBM grid is identical for all percentiles).
+    tree: cKDTree | None = None
+    iy_cached: int | None = None
+    ix_cached: int | None = None
+    grid_shape: tuple[int, ...] | None = None
+
     for pct in NBM_PERCENTILES:
         search = f":TMP:2 m above ground:12-30 hour max fcst:{pct}% level:"
         try:
@@ -97,13 +116,26 @@ def fetch_nbm_percentiles(
             continue
 
         var = list(ds.data_vars)[0]
-        lats = ds.latitude.values.ravel()
-        lons = ds.longitude.values.ravel()
-        tree = cKDTree(np.stack([lats, lons], axis=1))
-        _, idx = tree.query([lat, lon])
-        iy, ix = np.unravel_index(idx, ds.latitude.shape)
-        val_k = float(ds[var].values[iy, ix])
+
+        if tree is None:
+            # Build tree once from the first successfully-fetched level
+            lats = ds.latitude.values.ravel()
+            lons = ds.longitude.values.ravel()
+            tree = cKDTree(np.stack([lats, lons], axis=1))
+            grid_shape = ds.latitude.shape
+            _, idx = tree.query([lat, lon])
+            iy_cached, ix_cached = np.unravel_index(idx, grid_shape)
+
+        val_k = float(ds[var].values[iy_cached, ix_cached])
         results[float(pct)] = _k_to_f(val_k)
+
+    if len(results) < 15:
+        raise RuntimeError(
+            f"fetch_nbm_percentiles: only {len(results)}/{len(NBM_PERCENTILES)} "
+            f"percentile levels returned for run={run} fxx={fxx} — likely an S3/"
+            f"availability/auth failure, not genuine sparsity; refusing to emit a "
+            f"biased distribution."
+        )
 
     return results
 
@@ -121,9 +153,17 @@ def fetch_gefs_members(
     Grid extraction: xarray .sel(method="nearest") on regular lat/lon grid.
     Units: Kelvin → °F.
 
+    lon MUST be in [0,360] (0-360 grid; pass lon+360 for western longitudes).
+
     Returns:
         List of 31 float °F values, one per member [c00, p01, ..., p30].
     """
+    if not (0.0 <= lon <= 360.0):
+        raise ValueError(
+            f"lon must be in [0,360] (0-360 grid convention); got {lon}. "
+            f"For W longitudes pass lon+360 (e.g. KNYC -73.9693 -> 286.0307)."
+        )
+
     from herbie import Herbie
 
     run_str = run.strftime("%Y-%m-%d %H:%M")
