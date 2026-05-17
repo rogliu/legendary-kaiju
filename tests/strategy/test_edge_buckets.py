@@ -16,7 +16,16 @@ def test_bucket_probs_sum_to_one_and_match_pmf():
     assert pytest.approx(sum(probs.values())) == 1.0
 
 def test_renormalizes_when_buckets_cover_partial_support():
-    pmf = TempPMF.from_probs(low_f=0, probs=[0.5, 0.5])  # 0,1
-    buckets = [Bucket("A", 0, 0), Bucket("B", 1, 1)]
+    # PMF over {0,1,2,3}; buckets cover only {1,2} -> raw total 0.7 (< 1.0)
+    pmf = TempPMF.from_probs(low_f=0, probs=[0.1, 0.3, 0.4, 0.2])  # 0,1,2,3
+    buckets = [Bucket("A", 1, 1), Bucket("B", 2, 2)]  # raw: 0.3, 0.4 ; total 0.7
     probs = bucket_probabilities(pmf, buckets)
-    assert pytest.approx(sum(probs.values())) == 1.0
+    assert pytest.approx(probs["A"]) == 0.3 / 0.7
+    assert pytest.approx(probs["B"]) == 0.4 / 0.7
+    assert pytest.approx(sum(probs.values())) == 1.0  # renormalized to 1
+
+def test_raises_when_buckets_capture_no_mass():
+    pmf = TempPMF.from_probs(low_f=50, probs=[0.5, 0.5])  # 50,51
+    buckets = [Bucket("X", 90, 95)]  # entirely outside PMF support -> total 0
+    with pytest.raises(ValueError, match="buckets capture no PMF mass"):
+        bucket_probabilities(pmf, buckets)
