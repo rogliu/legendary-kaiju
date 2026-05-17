@@ -35,6 +35,13 @@ Cross-task contracts honoured
    (log + backoff). The two exception types are not conflated.
 7. Multi-city / unmapped series: resolve_settlement raises KeyError on unknown tickers,
    which propagates loud — intentional, not suppressed.
+
+Known v1 limitations
+---------------------
+- Daily-loss realized-PnL source is not yet wired (Task 18 will add the pnl table).
+  Until then, RiskGate's daily-loss kill is INERT. See run_intraday for loud warnings.
+- orderbook_delta WS messages are currently applied as snapshots (v1 limitation);
+  incremental delta application is deferred to a future task.
 """
 
 from __future__ import annotations
@@ -65,6 +72,9 @@ _DEFAULT_MAX_EXP = 250.0   # 50% of default bankroll
 _DEFAULT_MAX_LOSS = 50.0
 _DEFAULT_KILL_PATH = "/tmp/kaiju_kill"
 
+# Named constant for min_open_interest default (Fix #7 — no magic literal in loop).
+_DEFAULT_MIN_OPEN_INTEREST = 100
+
 
 # ---------------------------------------------------------------------------
 # Deterministic tick (all IO via deps)
@@ -85,7 +95,7 @@ def run_intraday_once(
     max_contracts_per_market: int = _DEFAULT_MAX_CT,
     max_open_exposure_usd: float = _DEFAULT_MAX_EXP,
     max_daily_loss_usd: float = _DEFAULT_MAX_LOSS,
-    kill_switch_path: str = _DEFAULT_KILL_PATH,
+    kill_switch_path: str | None = None,
 ) -> dict:
     """Execute one evaluation tick; all side-effects via deps.
 
@@ -111,11 +121,17 @@ def run_intraday_once(
         Minimum net edge (fraction) for a trade to be accepted.
     min_open_interest:
         Minimum open interest for a market to be considered.
+    kill_switch_path:
+        Optional path to kill-switch file (overrides the default /tmp/kaiju_kill).
+        Passing a path to an existing file will block all entries — useful in tests.
 
     Returns
     -------
     dict with keys: station, climate_date, mode, n_entries, n_exits, report
     """
+    # Resolve kill-switch path (optional override for testing, default otherwise).
+    ks_path = kill_switch_path if kill_switch_path is not None else _DEFAULT_KILL_PATH
+
     # Open / init state (needed for RiskGate realized-loss query).
     state = State(db_path)
     state.init_schema()
@@ -143,7 +159,7 @@ def run_intraday_once(
 
     # RiskGate: per-intent approval.
     gate = RiskGate(
-        kill_switch_path=kill_switch_path,
+        kill_switch_path=ks_path,
         max_contracts_per_market=max_contracts_per_market,
         max_open_exposure_usd=max_open_exposure_usd,
         max_daily_loss_usd=max_daily_loss_usd,
@@ -273,12 +289,14 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
 
     Contract references:
       2. pm.reconcile (async) passed as on_connect_reconcile — honoured below.
-      3. shadow-paper: simulate_fills called after execute_entries.
+      3. shadow-paper: simulate_fills called after execute_entries AND execute_exits.
          live: fill WS events call pm.clear_working_orders_for_market.
       4. OI from parse_event_snapshot(list_markets(...)), never from get_quote.
       5. CUT exits: explicit limit from current quote bid before execute_exits.
       6. LookupError vs httpx errors split in IEM/forecast calls.
       7. resolve_settlement raises on unknown series — propagates loud.
+
+    Safety note: RiskGate daily-loss limit is INERT until Task 18 wires the pnl table.
     """
     # --- Deferred heavy imports ---
     import asyncio
@@ -302,6 +320,18 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
     from kaiju.strategy.fairvalue import fair_prices as compute_fair_prices
 
     cfg: Any = settings or Settings()  # type: ignore[call-arg]
+
+    # Fix #1: Loud safety warnings — pnl/daily-loss source not yet wired (Task 18).
+    # This runs unconditionally before the loop so operators always see it.
+    log.warning(
+        "SAFETY: pnl/realized-loss source not yet wired (Task 18); "
+        "RiskGate daily-loss limit is INERT."
+    )
+    if mode == "live":
+        log.error(
+            "UNSAFE: live mode with INERT daily-loss limit — "
+            "do NOT run live until Task 18 pnl wiring lands."
+        )
 
     # --- Resolve settlement metadata (raises KeyError for unknown series) ---
     # Map station human name to series ticker.
@@ -331,8 +361,7 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
     # --- Derive climate_date (today in station tz) ---
     from zoneinfo import ZoneInfo  # stdlib Python 3.9+
     tz = ZoneInfo(settlement["tz"])
-    today_local = datetime.now(tz)
-    climate_date = today_local.strftime("%Y-%m-%d")
+    climate_date = datetime.now(tz).strftime("%Y-%m-%d")
 
     # --- Forecast + nowcast ---
     nbm_pct: dict[float, float] | None = None
@@ -341,12 +370,19 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
     pmf = None
 
     def _refresh_forecast() -> None:
-        """Re-fetch forecast and nowcast; updates pmf in the enclosing scope."""
+        """Re-fetch forecast and nowcast; updates pmf in the enclosing scope.
+
+        Fix #2b: uses fresh datetime.now(tz) at call time so post-startup
+        NBM/GEFS runs are picked up during the trading day.
+        """
         nonlocal nbm_pct, gefs_members, obs_max, pmf
+
+        # Fix #2b: fresh local time at each recompute call (not stale startup time).
+        now = datetime.now(tz)
 
         # NBM percentiles.
         try:
-            run_dt = _latest_nbm_run(today_local)
+            run_dt = _latest_nbm_run(now)
             nbm_pct = fetch_nbm_percentiles(
                 lat=_station_lat(station),
                 lon=_station_lon360(station),
@@ -357,7 +393,7 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
 
         # GEFS members.
         try:
-            run_dt = _latest_gefs_run(today_local)
+            run_dt = _latest_gefs_run(now)
             gefs_members = fetch_gefs_members(
                 lat=_station_lat(station),
                 lon=_station_lon360(station),
@@ -434,9 +470,19 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
         market_ticker = evt.get("market_ticker", "")
 
         if msg_type in ("orderbook_snapshot", "orderbook_delta"):
+            if msg_type == "orderbook_delta":
+                # v1 limitation: delta messages are applied as snapshots.
+                # Incremental delta application is deferred to a future task.
+                log.debug(
+                    "orderbook_delta received; v1 applies snapshots only, "
+                    "delta not incrementally applied"
+                )
+
             # Update PaperBook for shadow-paper sim.
             yes_lvls = evt.get("yes_dollars_fp") or []
             no_lvls = evt.get("no_dollars_fp") or []
+
+            # Fix #4: _lvl_to_cents returns a 2-element [price_cents, size] list.
             def _lvl_to_cents(lvl: list) -> list[int]:
                 return [round(float(lvl[0]) * 100), int(float(lvl[1]))]
 
@@ -483,6 +529,15 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
         on_connect_reconcile=pm.reconcile,  # async def — contract 2
     )
 
+    # Fix #5: construct RiskGate ONCE before the loop (params are frozen from cfg).
+    gate = RiskGate(
+        kill_switch_path="/tmp/kaiju_kill",
+        max_contracts_per_market=cfg.max_contracts_per_market,
+        max_open_exposure_usd=cfg.bankroll_usd * 0.5,
+        max_daily_loss_usd=cfg.max_daily_loss_usd,
+        bankroll_usd=cfg.bankroll_usd,
+    )
+
     # --- Main async loop ---
     async def _main() -> None:
         RECOMPUTE_INTERVAL_S = 300   # Re-pull forecast every 5 min
@@ -494,126 +549,135 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
 
         try:
             while not timestop_reached:
-                now = time.monotonic()
+                now_mono = time.monotonic()
 
                 # Periodic forecast recompute.
-                if now - last_recompute >= RECOMPUTE_INTERVAL_S:
+                if now_mono - last_recompute >= RECOMPUTE_INTERVAL_S:
                     _refresh_forecast()
-                    last_recompute = now
+                    last_recompute = now_mono
 
                 if pmf is None:
                     log.warning("PMF not available; sleeping before retry.")
                     await asyncio.sleep(30)
                     continue
 
-                # Compute fair values.
-                fair = compute_fair_prices(pmf, snapshot.buckets)
-
-                # Current positions from state.
-                pos_rows = state.list_positions()
-                from kaiju.types import Position as _Position
-                current_positions = {
-                    r["market"]: _Position(
-                        market_ticker=r["market"],
-                        side=r["side"],
-                        count=r["count"],
-                        avg_entry_cents=r["avg_entry_cents"],
-                        climate_date=r["climate_date"],
-                    )
-                    for r in pos_rows
-                    if r["count"] > 0
-                }
-
-                # Check time-stop.
-                minutes_to_close = _minutes_to_day_close(today_local, tz)
+                # Check time-stop (outside the per-tick try/except — must terminate loop).
+                minutes_to_close = _minutes_to_day_close(tz)
                 if minutes_to_close < TIMESTOP_MINUTES:
-                    log.info("Time-stop reached (%d min to close). Stopping entries.", minutes_to_close)
+                    log.info(
+                        "Time-stop reached (%d min to close). Stopping entries.",
+                        minutes_to_close,
+                    )
                     timestop_reached = True
                     ws.stop()
                     break
 
-                # --- Exits (contract 5: explicit CUT limit from current quote) ---
-                exit_decisions: dict = {}
-                for market, pos in current_positions.items():
-                    q = live_quotes.get(market)
-                    if q is None:
-                        continue
-                    fair_cents_for_market = fair.get(market)
-                    if fair_cents_for_market is None:
-                        continue
-                    dec = decide_exit(
-                        position=pos,
-                        fair_cents=fair_cents_for_market,
-                        quote=q,
-                        minutes_to_timestop=minutes_to_close - TIMESTOP_MINUTES,
-                        exit_margin_cents=3,
-                        fill_margin_cents=1,
+                # Fix #2a: wrap the trade evaluation body so one bad tick never kills
+                # the day. Time-stop, WS lifecycle, and sleep stay OUTSIDE this block.
+                try:
+                    # Compute fair values.
+                    fair = compute_fair_prices(pmf, snapshot.buckets)
+
+                    # Current positions from state.
+                    pos_rows = state.list_positions()
+                    from kaiju.types import Position as _Position
+                    current_positions = {
+                        r["market"]: _Position(
+                            market_ticker=r["market"],
+                            side=r["side"],
+                            count=r["count"],
+                            avg_entry_cents=r["avg_entry_cents"],
+                            climate_date=r["climate_date"],
+                        )
+                        for r in pos_rows
+                        if r["count"] > 0
+                    }
+
+                    # --- Exits (contract 5: explicit CUT limit from current quote) ---
+                    exit_decisions: dict = {}
+                    for market, pos in current_positions.items():
+                        q = live_quotes.get(market)
+                        if q is None:
+                            continue
+                        fair_cents_for_market = fair.get(market)
+                        if fair_cents_for_market is None:
+                            continue
+                        dec = decide_exit(
+                            position=pos,
+                            fair_cents=fair_cents_for_market,
+                            quote=q,
+                            minutes_to_timestop=minutes_to_close - TIMESTOP_MINUTES,
+                            exit_margin_cents=3,
+                            fill_margin_cents=1,
+                        )
+                        # Contract 5: patch CUT with explicit limit from quote bid.
+                        if dec.action == ExitAction.CUT and dec.limit_price_cents is None:
+                            bid = q.yes_bid if pos.side == "yes" else q.no_bid
+                            if bid is not None:
+                                dec = ExitDecision(ExitAction.CUT, bid, dec.reason)
+                            else:
+                                log.warning(
+                                    "CUT for %s: no bid in live quote, "
+                                    "PositionManager avg_entry fallback will fire.",
+                                    market,
+                                )
+                        exit_decisions[market] = dec
+
+                    if exit_decisions:
+                        pm.execute_exits(exit_decisions, climate_date)
+
+                        # Fix #2c: simulate_fills after exits so exit working orders
+                        # get paper-filled and clear_working_orders_for_market releases
+                        # the guard — otherwise markets with a placed exit are blocked.
+                        if mode in ("shadow-paper", "backtest"):
+                            simulate_fills(pm, paper_book, climate_date)
+
+                    # --- Entries ---
+                    raw_intents = select_gap_trades(
+                        fair_cents=fair,
+                        quotes=live_quotes,
+                        positions=current_positions,
+                        net_edge_threshold=cfg.net_edge_threshold,
+                        # Fix #7: use named constant instead of magic literal 100.
+                        min_open_interest=_DEFAULT_MIN_OPEN_INTEREST,
                     )
-                    # Contract 5: patch CUT with explicit limit from quote bid.
-                    if dec.action == ExitAction.CUT and dec.limit_price_cents is None:
-                        bid = q.yes_bid if pos.side == "yes" else q.no_bid
-                        if bid is not None:
-                            dec = ExitDecision(ExitAction.CUT, bid, dec.reason)
-                        else:
-                            log.warning(
-                                "CUT for %s: no bid in live quote, "
-                                "PositionManager avg_entry fallback will fire.",
-                                market,
-                            )
-                    exit_decisions[market] = dec
+                    sized = size_event(
+                        intents=raw_intents,
+                        bankroll_usd=cfg.bankroll_usd,
+                        kelly_fraction=cfg.kelly_fraction,
+                        max_bankroll_frac=cfg.max_bankroll_frac_per_event,
+                    )
+                    realized_loss = _realized_loss_today(state, climate_date, mode)
+                    open_exp = _open_exposure(current_positions)
+                    approved_entries = []
+                    running_exp = open_exp
+                    for intent in sized:
+                        dec_r = gate.check(intent, realized_loss, running_exp)
+                        if dec_r.approved:
+                            if dec_r.adjusted_count != intent.count:
+                                from kaiju.types import TradeIntent
+                                intent = TradeIntent(
+                                    intent.market_ticker,
+                                    intent.side,
+                                    intent.limit_price_cents,
+                                    dec_r.adjusted_count,
+                                    intent.model_prob,
+                                    intent.net_edge,
+                                )
+                            approved_entries.append(intent)
+                            running_exp += intent.count * intent.limit_price_cents / 100.0
 
-                if exit_decisions:
-                    pm.execute_exits(exit_decisions, climate_date)
+                    if approved_entries:
+                        pm.execute_entries(approved_entries, climate_date)
 
-                # --- Entries ---
-                raw_intents = select_gap_trades(
-                    fair_cents=fair,
-                    quotes=live_quotes,
-                    positions=current_positions,
-                    net_edge_threshold=cfg.net_edge_threshold,
-                    min_open_interest=100,
-                )
-                sized = size_event(
-                    intents=raw_intents,
-                    bankroll_usd=cfg.bankroll_usd,
-                    kelly_fraction=cfg.kelly_fraction,
-                    max_bankroll_frac=cfg.max_bankroll_frac_per_event,
-                )
-                gate = RiskGate(
-                    kill_switch_path="/tmp/kaiju_kill",
-                    max_contracts_per_market=cfg.max_contracts_per_market,
-                    max_open_exposure_usd=cfg.bankroll_usd * 0.5,
-                    max_daily_loss_usd=cfg.max_daily_loss_usd,
-                    bankroll_usd=cfg.bankroll_usd,
-                )
-                realized_loss = _realized_loss_today(state, climate_date, mode)
-                open_exp = _open_exposure(current_positions)
-                approved_entries = []
-                running_exp = open_exp
-                for intent in sized:
-                    dec_r = gate.check(intent, realized_loss, running_exp)
-                    if dec_r.approved:
-                        if dec_r.adjusted_count != intent.count:
-                            from kaiju.types import TradeIntent
-                            intent = TradeIntent(
-                                intent.market_ticker,
-                                intent.side,
-                                intent.limit_price_cents,
-                                dec_r.adjusted_count,
-                                intent.model_prob,
-                                intent.net_edge,
-                            )
-                        approved_entries.append(intent)
-                        running_exp += intent.count * intent.limit_price_cents / 100.0
+                        # Contract 3 / Fix #2c: simulate fills after entries.
+                        if mode in ("shadow-paper", "backtest"):
+                            simulate_fills(pm, paper_book, climate_date)
 
-                if approved_entries:
-                    pm.execute_entries(approved_entries, climate_date)
+                except Exception:  # unattended: never let one bad tick kill the day
+                    log.error("tick error; continuing", exc_info=True)
 
-                    # Contract 3: shadow-paper simulate fills after execute_entries.
-                    if mode in ("shadow-paper", "backtest"):
-                        simulate_fills(pm, paper_book, climate_date)
-
-                await asyncio.sleep(60)
+                await asyncio.sleep(60)  # keep cadence regardless
 
         finally:
             ws.stop()
@@ -683,8 +747,11 @@ def _latest_gefs_run(now_local):
     return _latest_nbm_run(now_local)
 
 
-def _minutes_to_day_close(today_local, tz) -> int:
-    """Return minutes until midnight local time (rough proxy for daily settlement)."""
+def _minutes_to_day_close(tz) -> int:
+    """Return minutes until midnight local time (rough proxy for daily settlement).
+
+    Fix #6: computes datetime.now(tz) internally; no stale today_local parameter.
+    """
     from datetime import datetime, timedelta
     now = datetime.now(tz)
     midnight = (now + timedelta(days=1)).replace(

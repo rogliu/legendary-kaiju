@@ -71,3 +71,49 @@ def test_tick_with_position_applies_exit_decisions(tmp_path):
     )
     assert d.exited and d.exited[0]["MID"].action is ExitAction.EXIT
     assert d.placed == []  # already positioned -> no new entry
+
+
+def test_kill_switch_blocks_all_entries(tmp_path):
+    """Kill-switch file present -> RiskGate rejects all entries; placed stays empty."""
+    ks = tmp_path / "KILL"
+    ks.write_text("stop")
+
+    d = Deps()
+    res = run_intraday_once(
+        station="NYC",
+        climate_date="2026-05-17",
+        db_path=str(tmp_path / "s.sqlite"),
+        mode="shadow-paper",
+        deps=d,
+        net_edge_threshold=0.08,
+        min_open_interest=100,
+        kill_switch_path=str(ks),
+    )
+    assert d.placed == [], f"expected no entries with kill-switch; got {d.placed}"
+    assert res["n_entries"] == 0
+
+
+def test_cut_decision_limit_patched_from_quote_bid(tmp_path):
+    """CUT decision with limit=None gets patched with the quote bid for the held side."""
+    from kaiju.types import Position, ExitDecision, ExitAction
+
+    d = Deps()
+    d.positions = lambda: {"MID": Position("MID", "yes", 2, 55, "2026-05-17")}  # type: ignore[method-assign]
+    d.exit_decisions = lambda: {"MID": ExitDecision(ExitAction.CUT, None, "thesis")}  # type: ignore[method-assign]
+
+    run_intraday_once(
+        station="NYC",
+        climate_date="2026-05-17",
+        db_path=str(tmp_path / "s.sqlite"),
+        mode="shadow-paper",
+        deps=d,
+        net_edge_threshold=0.08,
+        min_open_interest=100,
+    )
+
+    assert d.exited, "apply_exits should have been called"
+    applied = d.exited[0]["MID"]
+    assert applied.action is ExitAction.CUT
+    # Runner must have patched in the yes_bid from the quote (50 cents from Deps.quotes).
+    assert applied.limit_price_cents is not None, "limit_price_cents must be patched from quote bid"
+    assert applied.limit_price_cents == 50  # yes_bid from MarketQuote("MID", 50, ...)
