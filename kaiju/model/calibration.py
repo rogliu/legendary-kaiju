@@ -14,17 +14,25 @@ class CalibrationParams:
 def fit_calibration(fc_medians, realized, min_samples: int) -> CalibrationParams:
     fc = np.asarray(fc_medians, float)
     ob = np.asarray(realized, float)
+    if fc.shape != ob.shape:
+        raise ValueError(f"fc_medians and realized must have equal length, got {fc.shape} vs {ob.shape}")
     n = len(fc)
     raw_bias = float(np.mean(ob - fc)) if n else 0.0
     shrink = n / (n + min_samples) if (n + min_samples) > 0 else 0.0
     bias = shrink * raw_bias
     if n >= 2:
-        err = ob - fc - raw_bias
-        raw_scale = float(np.std(err) / (np.std(fc) + 1e-6)) or 1.0
-        scale = 1.0 + shrink * (raw_scale - 1.0)
+        std_fc = float(np.std(fc))
+        if std_fc < 1e-6:
+            scale = 1.0   # no forecast spread => cannot estimate a ratio
+        else:
+            err = ob - fc - raw_bias
+            raw_scale = float(np.std(err) / std_fc)
+            if raw_scale == 0.0:
+                raw_scale = 1.0
+            scale = 1.0 + shrink * (raw_scale - 1.0)
     else:
         scale = 1.0
-    return CalibrationParams(bias=bias, spread_scale=max(0.5, scale), n_samples=n)
+    return CalibrationParams(bias=bias, spread_scale=max(0.5, min(scale, 3.0)), n_samples=n)
 
 
 def apply_calibration(pmf: TempPMF, cal: CalibrationParams) -> TempPMF:
