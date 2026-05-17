@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  com.kaiju.daily.plist — launchd agent for the Kaiju daily lifecycle.
+
+  OPERATOR SETUP: before installing this file, edit the three REPLACE placeholders:
+
+  (1) ProgramArguments path: replace /REPLACE/WITH/ABS/PATH/legendary-kaiju
+      with the absolute path to your repo clone, e.g.:
+        /Users/yourname/projects/legendary-kaiju/deploy/run_daily.sh
+
+  (2) StartCalendarInterval: 06:30 local is the default. Align with NOAA data
+      availability per docs/superpowers/notes/noaa-forecast-contract.md.
+      NBM 06Z is typically ready by ~06:00 ET; Kalshi NYC markets open ~06:00 ET.
+      Adjust forward if NBM data consistently arrives late.
+
+  (3) StandardOutPath / StandardErrorPath: /tmp/kaiju.daily.log is ephemeral.
+      Consider ~/Library/Logs/kaiju.daily.log for persistence across reboots.
+
+  SECRETS: add an EnvironmentVariables dict with your KALSHI_KEY_ID,
+  KALSHI_PRIVATE_KEY (PEM string), KAIJU_MODE, and KAIJU_CITY values.
+  Never commit secret values; set them directly in the installed plist.
+
+  INSTALL:
+    cp deploy/com.kaiju.daily.plist ~/Library/LaunchAgents/
+    # edit the installed copy to set secrets and absolute paths
+    launchctl load ~/Library/LaunchAgents/com.kaiju.daily.plist
+
+  UNLOAD:
+    launchctl unload ~/Library/LaunchAgents/com.kaiju.daily.plist
+-->
+<dict>
+
+  <key>Label</key>
+  <string>com.kaiju.daily</string>
+
+  <!-- REPLACE: set the absolute path to run_daily.sh on this machine.
+       Example: /Users/yourname/projects/legendary-kaiju/deploy/run_daily.sh -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/REPLACE/WITH/ABS/PATH/legendary-kaiju/deploy/run_daily.sh</string>
+  </array>
+
+  <!-- Daily at 06:30 local time. REPLACE Hour/Minute to match your NOAA timing. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+
+  <!-- REPLACE: set to a writable absolute log path. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/kaiju.daily.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/kaiju.daily.log</string>
+
+  <!-- Do NOT run immediately on launchctl load; wait for the scheduled time. -->
+  <key>RunAtLoad</key>
+  <false/>
+
+</dict>
+</plist>
