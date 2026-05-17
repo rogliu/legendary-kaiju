@@ -20,6 +20,15 @@ Built, committed, both-reviews-passed on `main`: scaffold; `kaiju/types.py`; `ka
 
 **Conventions:** TDD per task (failing test → run fail → minimal impl → run pass → commit). `uv run pytest`, `uv run ruff check kaiju tests`, `uv run mypy kaiju` all green before commit. Commit trailer: `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`. Tasks marked **[SPIKE-STEP]** verify a live contract and record it to `docs/superpowers/notes/` before implementing against it — do not fabricate.
 
+> **PLAN CORRECTION (2026-05-17, mid-execution):** v1 Tasks 12–13
+> (`model/distribution.py`, `model/calibration.py`) were NEVER built (v1 paused
+> at Task 11). They are foundational pure-logic modules (depend only on
+> `TempPMF`) that the fair-value chain, runner, and retrain require. They are
+> added below as **Task 3A** and **Task 3B** (full content at the end of this
+> plan under "PLAN CORRECTION"). **Execute Task 3A then Task 3B immediately
+> after Task 3 and before Task 4.** Their content is the design-approved v1
+> Task 12/13 spec, unchanged.
+
 ---
 
 ## File structure (v2 additions/changes)
@@ -32,6 +41,8 @@ kaiju/strategy/sizing.py  # Task 1 review-fixes
 kaiju/strategy/edge.py    # +select_gap_trades (Task 5)
 kaiju/strategy/fairvalue.py   # NEW pmf->fair cents per bucket (Task 4)
 kaiju/strategy/exit_policy.py # NEW convergence/thesis/time-stop (Task 6)
+kaiju/model/distribution.py   # NEW NBM%->PMF + GEFS blend (Task 3A, plan correction)
+kaiju/model/calibration.py    # NEW low-param bias/spread calib (Task 3B, plan correction)
 kaiju/model/nowcast.py        # NEW observed-temp conditioning (Task 3)
 kaiju/risk/limits.py          # NEW round-trip-aware risk gate (Task 7)
 kaiju/eval/metrics.py         # NEW Brier/CRPS/PIT + v2 metrics (Task 8)
@@ -959,11 +970,11 @@ def test_cli_help():
 
 ## Self-Review (completed by plan author)
 
-**1. Spec coverage:** v2 §3 nowcast→T3; §3 forecast PMF reused (built) + fair value T4; §4 entry→T5, exits→T6; §5 WS loop→T14+T17, timers/reconcile→T17, lifecycle→T17/T18/T19; §6 position mgr→T15, risk gate→T7; §7 modes/paper-sim→T16, gate metrics→T8, arm→T8; §2 data contracts→T10/T11/T12/T13 (recorded notes); §8 module map→all; §9 Task-11 fixes→T1, types→T2, state ext→T9; deploy→T20, runbook→T21. All spec sections mapped.
+**1. Spec coverage:** v2 §3 nowcast→T3; §3 forecast PMF→**Task 3A (distribution) + Task 3B (calibration)** [plan correction] + fair value T4; §4 entry→T5, exits→T6; §5 WS loop→T14+T17, timers/reconcile→T17, lifecycle→T17/T18/T19; §6 position mgr→T15, risk gate→T7; §7 modes/paper-sim→T16, gate metrics→T8, arm→T8; §2 data contracts→T10/T11/T12/T13 (recorded notes); §8 module map→all; §9 Task-11 fixes→T1, types→T2, state ext→T9; deploy→T20, runbook→T21. All spec sections mapped.
 
 **2. Placeholder scan:** External specifics are bound by recorded notes / explicit [SPIKE-STEP] tasks (T10 step1, T14 step1) before dependent code; fixture-asserted values say "set to the real value in the committed fixture" — these are verification anchors, not unfilled placeholders. No "TODO/handle edge cases" instructions remain.
 
-**3. Type consistency:** `Position`/`ExitDecision`/`ExitAction` defined T2, used T5/T6/T15. `fair_prices`→`dict[str,int]` cents consumed by T5/T6/T17. `select_gap_trades`/`decide_exit`/`RiskGate.check`/`PositionManager.execute_*`/`run_intraday_once`/`settle_day`/`retrain_calibration` signatures consistent across references. Reused built fns (`bucket_probabilities`,`trade_fee_cents`,`size_event`,`fit_calibration`) keep their existing signatures. SecretStr `.get_secret_value()` enforced in T12.
+**3. Type consistency:** `Position`/`ExitDecision`/`ExitAction` defined T2, used T5/T6/T15. `fair_prices`→`dict[str,int]` cents consumed by T5/T6/T17. `select_gap_trades`/`decide_exit`/`RiskGate.check`/`PositionManager.execute_*`/`run_intraday_once`/`settle_day`/`retrain_calibration` signatures consistent across references. Reused already-built fns (`bucket_probabilities`,`trade_fee_cents`,`size_event`) keep their existing signatures. `pmf_from_nbm_percentiles`/`blend_pmfs`/`fit_calibration`/`apply_calibration`/`CalibrationParams` are built by Tasks 3A/3B [plan correction] and consumed by T4/T17/T19. SecretStr `.get_secret_value()` enforced in T12.
 
 ## Risks carried from spec (not re-litigated)
 
@@ -971,3 +982,141 @@ def test_cli_help():
 - Convergence-not-guaranteed / market-converges-to-truth → nowcast (T3) + thesis-invalidation exit (T6) + bounded hold-to-settlement.
 - Kalshi fee coefficient + WS schema UNVERIFIED → pinned + [SPIKE-STEP]/demo-smoke confirmation (T12/T14).
 - `*.5` strike double-count → enforced + tested in T13.
+
+---
+
+# PLAN CORRECTION — Task 3A & Task 3B (execute after Task 3, before Task 4)
+
+These two foundational pure-logic modules were omitted from the body (v1 Tasks
+12–13 were never built). Content is the design-approved v1 spec, unchanged.
+They depend only on `kaiju/types.py:TempPMF`. `kaiju/model/__init__.py` already
+exists (created in Task 3).
+
+## Task 3A: Forecast distribution builder
+
+**Files:** Create `kaiju/model/distribution.py`; Test `tests/model/test_distribution.py`.
+
+- [ ] **Step 1: Write the failing test** `tests/model/test_distribution.py`:
+```python
+import numpy as np, pytest
+from kaiju.model.distribution import pmf_from_nbm_percentiles, blend_pmfs
+from kaiju.types import TempPMF
+
+def test_pmf_from_percentiles_is_monotone_and_normalized():
+    pct = {10: 60.0, 25: 62.0, 50: 65.0, 75: 68.0, 90: 70.0}
+    pmf = pmf_from_nbm_percentiles(pct)
+    assert isinstance(pmf, TempPMF)
+    assert pytest.approx(pmf.probs.sum()) == 1.0
+    cdf = np.cumsum(pmf.probs)
+    assert np.all(np.diff(cdf) >= -1e-12)
+    assert abs(pmf.prob_interval(None, 65) - 0.5) < 0.08
+
+def test_blend_is_convex_combination():
+    a = TempPMF.from_probs(0, [1.0, 0.0])
+    b = TempPMF.from_probs(0, [0.0, 1.0])
+    blended = blend_pmfs([(a, 0.75), (b, 0.25)])
+    assert pytest.approx(blended.prob_at(0)) == 0.75
+    assert pytest.approx(blended.prob_at(1)) == 0.25
+```
+
+- [ ] **Step 2: Run** `uv run pytest tests/model/test_distribution.py -v` → FAIL.
+
+- [ ] **Step 3: Implement** `kaiju/model/distribution.py`:
+```python
+from __future__ import annotations
+import numpy as np
+from kaiju.types import TempPMF
+
+def pmf_from_nbm_percentiles(pct_to_temp: dict[float, float]) -> TempPMF:
+    """Interpolate calibrated percentile->temp to a discrete integer-°F PMF."""
+    qs = np.array(sorted(pct_to_temp), dtype=float) / 100.0
+    ts = np.array([pct_to_temp[p] for p in sorted(pct_to_temp)], dtype=float)
+    lo, hi = int(np.floor(ts.min())) - 1, int(np.ceil(ts.max())) + 1
+    grid = np.arange(lo, hi + 1)
+    cdf = np.interp(grid, ts, qs, left=0.0, right=1.0)
+    pmf = np.diff(np.concatenate([[0.0], cdf]))
+    pmf = np.clip(pmf, 0.0, None)
+    return TempPMF.from_probs(low_f=lo, probs=pmf)
+
+def blend_pmfs(weighted: list[tuple[TempPMF, float]]) -> TempPMF:
+    lo = min(p.low_f for p, _ in weighted)
+    hi = max(p.high_f for p, _ in weighted)
+    acc = np.zeros(hi - lo + 1)
+    for pmf, w in weighted:
+        acc[pmf.low_f - lo: pmf.low_f - lo + len(pmf.probs)] += w * pmf.probs
+    return TempPMF.from_probs(low_f=lo, probs=acc)
+```
+
+- [ ] **Step 4: Run** `uv run pytest tests/model/test_distribution.py -v` → PASS; full suite green; ruff/mypy clean.
+
+- [ ] **Step 5: Commit** `git add kaiju/model/distribution.py tests/model/test_distribution.py && git commit -m "feat: NBM percentile -> PMF and convex PMF blend"`
+
+## Task 3B: Low-parameter calibration (bias + spread, with shrinkage)
+
+**Files:** Create `kaiju/model/calibration.py`; Test `tests/model/test_calibration.py`.
+
+- [ ] **Step 1: Write the failing test** `tests/model/test_calibration.py`:
+```python
+import pytest
+from kaiju.types import TempPMF
+from kaiju.model.calibration import fit_calibration, apply_calibration, CalibrationParams
+
+def test_bias_is_shrunk_when_few_samples():
+    fc_medians = [60.0, 65.0, 70.0]
+    realized   = [57, 62, 67]
+    cal = fit_calibration(fc_medians, realized, min_samples=20)
+    assert -3.0 < cal.bias < 0.0
+    assert cal.n_samples == 3
+
+def test_apply_shifts_pmf_by_bias_and_scales_spread():
+    pmf = TempPMF.from_probs(60, [0.25, 0.5, 0.25])
+    cal = CalibrationParams(bias=-1.0, spread_scale=1.0, n_samples=50)
+    out = apply_calibration(pmf, cal)
+    assert pytest.approx(out.probs.sum()) == 1.0
+    assert out.prob_interval(None, 60) > pmf.prob_interval(None, 60)
+```
+
+- [ ] **Step 2: Run** `uv run pytest tests/model/test_calibration.py -v` → FAIL.
+
+- [ ] **Step 3: Implement** `kaiju/model/calibration.py`:
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+import numpy as np
+from kaiju.types import TempPMF
+
+@dataclass(frozen=True)
+class CalibrationParams:
+    bias: float
+    spread_scale: float
+    n_samples: int
+
+def fit_calibration(fc_medians, realized, min_samples: int) -> CalibrationParams:
+    fc = np.asarray(fc_medians, float); ob = np.asarray(realized, float)
+    n = len(fc)
+    raw_bias = float(np.mean(ob - fc)) if n else 0.0
+    shrink = n / (n + min_samples) if (n + min_samples) > 0 else 0.0
+    bias = shrink * raw_bias
+    if n >= 2:
+        err = ob - fc - raw_bias
+        raw_scale = float(np.std(err) / (np.std(fc) + 1e-6)) or 1.0
+        scale = 1.0 + shrink * (raw_scale - 1.0)
+    else:
+        scale = 1.0
+    return CalibrationParams(bias=bias, spread_scale=max(0.5, scale), n_samples=n)
+
+def apply_calibration(pmf: TempPMF, cal: CalibrationParams) -> TempPMF:
+    temps = np.arange(pmf.low_f, pmf.high_f + 1, dtype=float)
+    mean = float((temps * pmf.probs).sum())
+    new_temps = mean + cal.bias + (temps - mean) * cal.spread_scale
+    lo = int(np.floor(new_temps.min())); hi = int(np.ceil(new_temps.max()))
+    grid = np.arange(lo, hi + 1)
+    acc = np.zeros(len(grid))
+    idx = np.clip(np.round(new_temps).astype(int) - lo, 0, len(grid) - 1)
+    np.add.at(acc, idx, pmf.probs)
+    return TempPMF.from_probs(low_f=lo, probs=acc)
+```
+
+- [ ] **Step 4: Run** `uv run pytest tests/model/test_calibration.py -v` → PASS; full suite green; ruff/mypy clean.
+
+- [ ] **Step 5: Commit** `git add kaiju/model/calibration.py tests/model/test_calibration.py && git commit -m "feat: low-parameter bias/spread calibration with shrinkage"`
