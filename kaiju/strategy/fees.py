@@ -42,20 +42,29 @@ def trade_fee_cents(price_cents: int, count: int) -> int:
     """Return the taker fee in whole cents (rounded up) for a single order.
 
     Args:
-        price_cents: YES-side price in integer cents (1–99).
-        count: Number of contracts in the order (≥ 1).
+        price_cents: YES-side price in integer cents (1–99).  Enforced: must be
+            in the closed range [1, 99]; raises ValueError otherwise.
+        count: Number of contracts in the order (≥ 1).  Enforced: must be >= 1;
+            raises ValueError otherwise.
 
     Returns:
         Fee in integer cents (ceiling after centicent rounding).
+
+    Raises:
+        ValueError: if price_cents is not in 1..99 or count < 1.
 
     Formula:
         per_contract_centicents = ceil(FEE_COEFF × (price_cents/100) × (1 − price_cents/100) × 10_000)
         fee_cents = ceil(per_contract_centicents × count / 100)
     """
+    if not (1 <= price_cents <= 99):
+        raise ValueError(f"price_cents must be 1..99, got {price_cents}")
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
     p = price_cents / 100.0
     raw_dollars_per_contract = FEE_COEFF * p * (1.0 - p)
     # Round up per-contract fee to nearest centicent ($0.0001), guarding
-    # against floating-point noise (e.g. 0.07×0.25×10000 = 175.0000000...03).
+    # against IEEE-754 noise before ceil (e.g. p=50: 0.07*0.50*0.50*10_000 = 175.00000000000003).
     per_contract_centicents = math.ceil(round(raw_dollars_per_contract * _CENTICENTS_PER_DOLLAR, 10))
     total_centicents = per_contract_centicents * count
     return math.ceil(total_centicents / 100)
