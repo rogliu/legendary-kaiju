@@ -1,0 +1,19 @@
+# Secret files — must never be baked into the image
+.env
+.env.*
+
+# Version control
+.git
+
+# Python virtual environment
+.venv
+
+# Test and dev tooling — not needed in production image
+tests/
+deploy/
+docs/
+__pycache__/
+*.sqlite
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

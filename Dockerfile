@@ -10,9 +10,11 @@
 
 FROM python:3.12-slim
 
-# Install the eccodes C library required by cfgrib/herbie-data at runtime.
+# Install the eccodes C library AND definition tables required by cfgrib/herbie-data at runtime.
+# libeccodes0 = shared library; libeccodes-data = GRIB definition tables (needed for decode).
+# To verify at runtime after `docker build`: docker run <img> python -c "import cfgrib; from herbie import Herbie"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libeccodes0 \
+    && apt-get install -y --no-install-recommends libeccodes0 libeccodes-data \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv (fast Python package manager used by this project).

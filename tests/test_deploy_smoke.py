@@ -1,4 +1,5 @@
 import pathlib
+import re
 import stat
 import subprocess
 import sys
@@ -30,7 +31,11 @@ def test_deploy_artifacts_exist_and_wrapper_executable():
     assert sh.stat().st_mode & stat.S_IXUSR, "run_daily.sh not executable"
     # Dockerfile must NOT copy .env (no secret baked into image)
     dft = df.read_text()
-    assert ".env" not in dft or "COPY .env" not in dft
+    # no COPY/ADD of .env or the whole build context (would bake the plaintext key)
+    assert not re.search(r'(?im)^\s*(COPY|ADD)\s+\.env\b', dft), "Dockerfile copies .env"
+    assert not re.search(r'(?im)^\s*(COPY|ADD)\s+\.(\s|/)', dft), "Dockerfile copies whole context"
+    di = (ROOT / ".dockerignore")
+    assert di.is_file() and ".env" in di.read_text(), ".dockerignore missing or doesn't exclude .env"
     assert "kaiju.runner" in dft
     # wrapper invokes settle, retrain, run
     sht = sh.read_text()

@@ -63,5 +63,47 @@
   <key>RunAtLoad</key>
   <false/>
 
+  <!--
+    SECRETS + PATH — launchd does NOT inherit the user's shell environment.
+    You MUST set every value here; a missing PATH means `uv` is not found
+    and the job silently fails. Never commit real secret values.
+
+    REPLACE each placeholder before installing:
+      PATH             - include the directory where `uv` is installed on this machine.
+      KALSHI_KEY_ID    - your Kalshi API key ID.
+      KALSHI_PRIVATE_KEY - your Kalshi RSA private key as a single-line PEM string
+                           (no literal BEGIN/END header lines; use the raw base64 only,
+                            or a path to the key file, whichever your auth code reads).
+      KAIJU_MODE       - shadow-paper (safe default) or live (requires KAIJU_LIVE_ARM_TOKEN).
+      KAIJU_CITIES     - comma-separated station list read by kaiju.Settings (e.g. KNYC).
+      KAIJU_CITY       - single station code read by run_daily.sh for the station flag.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- REPLACE: colon-separated PATH that includes the directory containing `uv`. -->
+    <key>PATH</key>
+    <string>/REPLACE/HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+
+    <!-- REPLACE: Kalshi API credentials. -->
+    <key>KALSHI_KEY_ID</key>
+    <string>REPLACE_KALSHI_KEY_ID</string>
+
+    <!-- REPLACE: RSA private key PEM string (single-line or file path per your auth impl). -->
+    <key>KALSHI_PRIVATE_KEY</key>
+    <string>REPLACE_PEM_STRING</string>
+
+    <!-- REPLACE: shadow-paper is safe; set to live only with KAIJU_LIVE_ARM_TOKEN also set. -->
+    <key>KAIJU_MODE</key>
+    <string>shadow-paper</string>
+
+    <!-- REPLACE: comma-separated station list used by kaiju.Settings (KAIJU_CITIES env var). -->
+    <key>KAIJU_CITIES</key>
+    <string>KNYC</string>
+
+    <!-- REPLACE: single station code used by run_daily.sh (station flag) (KAIJU_CITY env var). -->
+    <key>KAIJU_CITY</key>
+    <string>NYC</string>
+  </dict>
+
 </dict>
 </plist>
