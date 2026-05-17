@@ -9,3 +9,5 @@ def test_exit_decision_actions():
     assert d.action is ExitAction.EXIT and d.limit_price_cents == 61
     h = ExitDecision(action=ExitAction.HOLD, limit_price_cents=None, reason="gap open")
     assert h.action is ExitAction.HOLD and h.limit_price_cents is None
+    c = ExitDecision(action=ExitAction.CUT, limit_price_cents=None, reason="stop hit")
+    assert c.action is ExitAction.CUT and c.limit_price_cents is None

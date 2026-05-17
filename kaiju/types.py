@@ -109,5 +109,5 @@ class Position:
 @dataclass(frozen=True)
 class ExitDecision:
     action: ExitAction
-    limit_price_cents: Optional[int]
+    limit_price_cents: Optional[int]  # None unless action is EXIT
     reason: str
