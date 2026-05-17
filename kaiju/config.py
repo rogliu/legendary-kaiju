@@ -26,10 +26,10 @@ class Settings(BaseSettings):
         default=0.08, validation_alias="KAIJU_NET_EDGE_THRESHOLD"
     )
     kelly_fraction: float = Field(
-        default=0.25, validation_alias="KAIJU_KELLY_FRACTION"
+        default=0.25, gt=0, le=1, validation_alias="KAIJU_KELLY_FRACTION"
     )
     max_bankroll_frac_per_event: float = Field(
-        default=0.10, validation_alias="KAIJU_MAX_BANKROLL_FRAC_PER_EVENT"
+        default=0.10, gt=0, le=1, validation_alias="KAIJU_MAX_BANKROLL_FRAC_PER_EVENT"
     )
     max_events_per_day: int = Field(
         default=8, validation_alias="KAIJU_MAX_EVENTS_PER_DAY"

@@ -60,3 +60,19 @@ def test_frozen_blocks_mutation(monkeypatch):
     s = Settings()
     with pytest.raises(Exception):
         s.mode = "live"
+
+
+def test_config_rejects_out_of_range_kelly_and_frac(monkeypatch):
+    import pytest
+    from kaiju.config import Settings
+    base = {"KALSHI_KEY_ID": "a", "KALSHI_PRIVATE_KEY": "k",
+            "KAIJU_MODE": "backtest", "KAIJU_CITIES": "KNYC"}
+    for k, v in [("KAIJU_KELLY_FRACTION", "1.5"), ("KAIJU_KELLY_FRACTION", "0"),
+                 ("KAIJU_MAX_BANKROLL_FRAC_PER_EVENT", "1.5"),
+                 ("KAIJU_MAX_BANKROLL_FRAC_PER_EVENT", "0")]:
+        for bk, bv in base.items():
+            monkeypatch.setenv(bk, bv)
+        monkeypatch.setenv(k, v)
+        with pytest.raises(Exception):
+            Settings()
+        monkeypatch.delenv(k, raising=False)
