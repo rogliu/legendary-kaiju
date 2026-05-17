@@ -1373,6 +1373,7 @@ def _build_arg_parser():
         "retrain", help="Retrain calibration model (implemented in Task 19)."
     )
     retrain_p.add_argument("--station", required=True, help="Station identifier.")
+    retrain_p.add_argument("--db", default=None, help="SQLite path (default: Settings.db_path)")
 
     return parser
 
@@ -1424,11 +1425,12 @@ if __name__ == "__main__":
             )
 
     elif args.command == "retrain":
-        # Task 19 will implement retrain_calibration; scaffold only.
-        raise SystemExit(
-            "retrain is not yet implemented (Task 19). "
-            "Run: python -m kaiju.runner retrain --station NYC"
-        )
+        from kaiju.config import Settings
+        cfg = Settings()  # type: ignore[call-arg]
+        db_path = args.db or cfg.db_path
+        cal = retrain_calibration(args.station, db_path, min_samples=cfg.paper_proof_days)
+        print(f"retrain station={args.station} db={db_path} -> "
+              f"n_samples={cal.n_samples} bias={cal.bias:.4f} spread_scale={cal.spread_scale:.4f}")
 
     else:
         parser.print_help()
