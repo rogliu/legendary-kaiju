@@ -36,7 +36,7 @@ def test_no_profitable_position_not_cut():
     # YES fair=30 -> NO fair=70 > entry 35 -> NOT cut (must not be CUT)
     d = decide_exit(N, fair_cents=30, quote=MarketQuote("M",0,0,60,80,500,1000),
                      minutes_to_timestop=120, exit_margin_cents=5, fill_margin_cents=2)
-    assert d.action is not ExitAction.CUT
+    assert d.action is ExitAction.HOLD and "gap" in d.reason
 
 def test_no_convergence_exits_in_no_space():
     # YES fair=30 -> NO fair=70 ; no_bid=69 -> |70-69|=1<=5 -> EXIT limit 70-2=68 (NO-space)
@@ -53,5 +53,11 @@ def test_no_convergence_open_gap_holds():
 def test_time_stop_wins_over_thesis_for_no():
     # past cutoff: even though NO fair 30 <= entry 35 (would be CUT), time-stop holds
     d = decide_exit(N, fair_cents=70, quote=q(0,0), minutes_to_timestop=-1,
+                     exit_margin_cents=5, fill_margin_cents=2)
+    assert d.action is ExitAction.HOLD and "time-stop" in d.reason
+
+def test_time_stop_wins_over_thesis_for_yes():
+    # YES fair=40 <= entry 45 would normally CUT, but past time-stop -> HOLD
+    d = decide_exit(P, fair_cents=40, quote=q(38,41), minutes_to_timestop=-1,
                      exit_margin_cents=5, fill_margin_cents=2)
     assert d.action is ExitAction.HOLD and "time-stop" in d.reason

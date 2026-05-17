@@ -19,6 +19,7 @@ def decide_exit(position: Position, fair_cents: int, quote: MarketQuote,
     entry = position.avg_entry_cents
 
     # Time-stop: bounded fallback wins -> hold remainder to settlement.
+    # minutes_to_timestop == 0 still attempts a clean exit; only strictly past cutoff (<0) holds
     if minutes_to_timestop < 0:
         return ExitDecision(ExitAction.HOLD, None, "time-stop: hold to settlement")
     # Thesis invalidation: the contract we hold is now worth <= what we paid.
