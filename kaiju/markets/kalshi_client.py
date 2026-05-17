@@ -34,7 +34,9 @@ UNVERIFIED items for Task 15/17 to confirm via live demo:
 from __future__ import annotations
 
 import base64
+import time
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -183,12 +185,15 @@ class KalshiClient:
         The path should be relative to base_url (e.g. "/markets/M-TICKER").
         Query parameters are passed via `params` dict, not embedded in `path`.
 
-        Signing uses only the path portion (no query string) per recorded contract.
+        Signing uses the FULL path including the base_url path prefix (e.g.
+        "/trade-api/v2/portfolio/balance") per recorded contract §2.
         """
-        import time
-
         timestamp_ms = int(time.time() * 1000)
-        sig, ts = sign_request(self._private_key_pem, method, path, timestamp_ms)
+        # Sign the full path from host root: base_url path prefix + endpoint path.
+        # Recorded contract §2 example: "1703123456789GET/trade-api/v2/portfolio/balance"
+        base_path = urlparse(self._base_url).path.rstrip("/")  # e.g. "/trade-api/v2"
+        full_path = base_path + path  # e.g. "/trade-api/v2/portfolio/balance"
+        sig, ts = sign_request(self._private_key_pem, method, full_path, timestamp_ms)
 
         headers = {
             "KALSHI-ACCESS-KEY": self._key_id,
@@ -197,6 +202,7 @@ class KalshiClient:
         }
 
         url = self._base_url + path
+        # NOTE: retry/backoff on 5xx deferred to runner (Task 17); failures propagate loud.
         with httpx.Client(timeout=self._timeout) as client:
             response = client.request(
                 method,
@@ -260,6 +266,12 @@ class KalshiClient:
             open_interest = 0 (same)
 
         UNVERIFIED: Level ordering (best-first assumed); confirm via live demo.
+
+        WARNING: open_interest and volume are 0 here (the orderbook endpoint carries
+        neither). strategy.edge.select_gap_trades SKIPS markets with
+        open_interest < min_open_interest (default ~100). Quotes from get_quote MUST
+        NOT be the trade-filter quote source. The runner must source open_interest /
+        volume from list_markets via markets.parser.parse_event_snapshot (Task 13).
         """
         data = self._request("GET", f"/markets/{market_ticker}/orderbook")
         ob = data.get("orderbook_fp", {})
