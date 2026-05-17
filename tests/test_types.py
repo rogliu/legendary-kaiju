@@ -1,4 +1,3 @@
-import numpy as np
 import pytest
 from kaiju.types import TempPMF, Bucket
 
@@ -24,3 +23,16 @@ def test_bucket_contains_semantics():
     assert b.contains(50) and b.contains(51) and not b.contains(52)
     lo_tail = Bucket(market_ticker="L", lower_f=None, upper_f=49)
     assert lo_tail.contains(-5) and lo_tail.contains(49) and not lo_tail.contains(50)
+
+def test_prob_at_outside_range_is_zero():
+    pmf = TempPMF.from_probs(low_f=10, probs=[0.5, 0.5])  # 10,11
+    assert pmf.prob_at(99) == 0.0
+    assert pmf.prob_at(-1) == 0.0
+
+def test_from_probs_rejects_empty_nan_and_2d():
+    with pytest.raises(ValueError):
+        TempPMF.from_probs(10, [])
+    with pytest.raises(ValueError):
+        TempPMF.from_probs(10, [0.3, float("nan"), 0.4])
+    with pytest.raises(ValueError):
+        TempPMF.from_probs(10, [[0.3, 0.7]])

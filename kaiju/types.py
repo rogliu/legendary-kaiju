@@ -16,12 +16,18 @@ class TempPMF:
     @classmethod
     def from_probs(cls, low_f: int, probs) -> "TempPMF":
         arr = np.asarray(probs, dtype=float)
+        if arr.ndim != 1:
+            raise ValueError("probs must be 1-D")
+        if not np.isfinite(arr).all():
+            raise ValueError("PMF has non-finite mass")
         if (arr < 0).any():
             raise ValueError("PMF has negative mass")
         total = arr.sum()
         if total <= 0:
             raise ValueError("PMF mass is non-positive")
-        return cls(low_f=int(low_f), probs=arr / total)
+        arr = arr / total
+        arr.flags.writeable = False
+        return cls(low_f=int(low_f), probs=arr)
 
     def prob_at(self, t: int) -> float:
         i = t - self.low_f
@@ -61,6 +67,7 @@ class MarketQuote:
 
 @dataclass(frozen=True)
 class EventSnapshot:
+    """Immutable per-run snapshot; do not mutate buckets/quotes after construction."""
     event_ticker: str
     station_id: str
     climate_date: str            # ISO date in the station's climate-day tz
