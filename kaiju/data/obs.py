@@ -41,8 +41,12 @@ class IEMClient:
                 params={"station": station, "network": network, "date": date},
             )
             response.raise_for_status()
+            try:
+                payload = response.json()
+            except Exception as e:
+                raise LookupError(f"IEM returned non-JSON response: {e}") from e
+            data = payload.get("data", [])
 
-        data = response.json().get("data", [])
         for row in data:
             if row.get("date") == date:
                 max_tmpf = row.get("max_tmpf")
@@ -74,6 +78,11 @@ class IEMClient:
 
         Raises:
             LookupError: If no valid (non-null, numeric) tmpf observations exist.
+
+        Note:
+            For a past date IEM returns the full day's observations, so this yields the
+            full-day observed max; intraday 'so far' time-of-day filtering is the
+            caller's responsibility (runner).
         """
         with httpx.Client(timeout=_TIMEOUT) as client:
             response = client.get(
@@ -81,12 +90,16 @@ class IEMClient:
                 params={"station": station, "network": "NY_ASOS", "date": date},
             )
             response.raise_for_status()
+            try:
+                payload = response.json()
+            except Exception as e:
+                raise LookupError(f"IEM returned non-JSON response: {e}") from e
+            obs = payload.get("data", [])
 
-        obs = response.json().get("data", [])
         valid = [
             o["tmpf"]
             for o in obs
-            if isinstance(o.get("tmpf"), (int, float))
+            if isinstance(o.get("tmpf"), (int, float)) and not isinstance(o.get("tmpf"), bool)
         ]
 
         if not valid:
