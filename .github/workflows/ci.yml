@@ -1,0 +1,47 @@
+name: CI
+
+# The unsupervised-merge trust boundary. With agents (not humans) producing
+# changes, a green `make check` here is what makes a merge trustworthy.
+# Recommended (a GitHub setting, not in this file): protect `main` and require
+# this workflow + Code Owners review (see .github/CODEOWNERS) before merge.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    name: make check (pytest + ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.12
+      - run: uv sync --dev
+      - run: make check
+
+  secrets:
+    name: no committed secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: .env must never be tracked
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked — the Kalshi RSA key must never be committed"
+            exit 1
+          fi
+          tracked_dotenv="$(git ls-files | grep -E '(^|/)\.env($|\.)' || true)"
+          if [ -n "$tracked_dotenv" ]; then
+            echo "::error::tracked dotenv file(s): $tracked_dotenv"
+            exit 1
+          fi
+          echo "OK: no tracked .env"
+      - name: warn on private-key material (non-blocking)
+        run: |
+          if git grep -nI -e "BEGIN RSA PRIVATE KEY" -e "BEGIN PRIVATE KEY" \
+               -e "BEGIN OPENSSH PRIVATE KEY" -- . ':!*.md' ':!docs/**'; then
+            echo "::warning::private-key-looking text found in tracked files — verify it is a generated test key, not a real credential"
+          else
+            echo "OK: no private-key material in tracked non-doc files"
+          fi

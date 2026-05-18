@@ -1,0 +1,2 @@
+# Claimed tasks live here as in-progress/<loop-id>/NNNN-slug.md.
+# The `git mv` into this dir is the atomic claim lock (see ../README.md).

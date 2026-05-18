@@ -1,0 +1,26 @@
+# CODEOWNERS — danger zones require the human owner.
+#
+# These paths are the safety/correctness core (see docs/INVARIANTS.md bottom).
+# An autonomous loop must NOT change them — it stops and escalates. This file
+# makes that enforceable on GitHub, but ONLY if branch protection on `main`
+# has "Require review from Code Owners" enabled (a repo setting, not in git).
+# Until that toggle is on, CODEOWNERS is advisory; the LOOP.md Stop & Escalate
+# rule is the primary guard.
+#
+# Replace @rogliu if the repo owner / required reviewer differs.
+
+# Money / safety core
+/kaiju/risk/                @rogliu
+/kaiju/eval/gate.py         @rogliu
+/kaiju/config.py            @rogliu
+/kaiju/markets/parser.py    @rogliu
+
+# Verified external-reality contracts (ground truth)
+/docs/superpowers/notes/    @rogliu
+
+# The rails themselves
+/docs/INVARIANTS.md         @rogliu
+/docs/agents/LOOP.md        @rogliu
+/tests/test_scope_lock.py   @rogliu
+/AGENTS.md                  @rogliu
+/.github/                   @rogliu
