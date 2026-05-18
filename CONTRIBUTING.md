@@ -69,3 +69,17 @@ quality) before merge — this discipline caught ~10 critical money/safety
 bugs during the build. Danger-zone changes additionally require the human
 owner via `CODEOWNERS`. An autonomous loop never reviews its own danger-zone
 change — it stops and escalates instead.
+
+**Single Code Owner caveat.** `.github/CODEOWNERS` currently lists one owner
+(`@rogliu`). GitHub forbids approving your own PR, so a *human* PR that
+touches a danger zone cannot be self-approved by that owner — it needs a
+second reviewer with write access, or a temporary protection relax by an
+admin. This does **not** affect loop autonomy: loops never open danger-zone
+PRs (they Stop & Escalate first), and non-danger-zone PRs need zero approvals
+and auto-merge on green.
+
+**Restoring the GitHub trust boundary.** Branch protection is GitHub state,
+not a repo file. The versioned source of truth is
+`scripts/setup-branch-protection.sh` — idempotent; run it to (re)apply the
+exact protection (required checks, `enforce_admins`, 0-approval +
+code-owner, auto-merge) if it is ever cleared or the repo is migrated.
