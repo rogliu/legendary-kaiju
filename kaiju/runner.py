@@ -58,14 +58,27 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any
 
+from kaiju.seams import resolve_seam
 from kaiju.state import State
-from kaiju.strategy.edge import select_gap_trades
 from kaiju.strategy.sizing import size_event
 from kaiju.risk.limits import RiskGate
 from kaiju.types import ExitAction, ExitDecision
 
 if TYPE_CHECKING:
     from kaiju.model.calibration import CalibrationParams
+
+# Seam callables resolve through the per-seam variant registry (kaiju.seams).
+# The default variant IS the incumbent (same function object), so behaviour is
+# unchanged unless a KAIJU_SEAM_* override is set. See docs/agents/EXPERIMENTS.md.
+_DISTRIBUTION_SEAM = resolve_seam("model/distribution")
+_CALIBRATION_SEAM = resolve_seam("model/calibration")
+pmf_from_nbm_percentiles = _DISTRIBUTION_SEAM.pmf_from_nbm_percentiles
+blend_pmfs = _DISTRIBUTION_SEAM.blend_pmfs
+fit_calibration = _CALIBRATION_SEAM.fit_calibration
+apply_calibration = _CALIBRATION_SEAM.apply_calibration
+nowcast_pmf = resolve_seam("model/nowcast").nowcast_pmf
+select_gap_trades = resolve_seam("strategy/edge").select_gap_trades
+decide_exit = resolve_seam("strategy/exit_policy").decide_exit
 
 log = logging.getLogger(__name__)
 
@@ -322,11 +335,13 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
     from kaiju.markets.kalshi_client import KalshiClient
     from kaiju.markets.parser import parse_event_snapshot, resolve_settlement
     from kaiju.markets.ws_client import WsClient, make_kalshi_ws_connect
-    from kaiju.model.calibration import apply_calibration, CalibrationParams
-    from kaiju.model.distribution import blend_pmfs, pmf_from_nbm_percentiles
-    from kaiju.model.nowcast import nowcast_pmf
-    from kaiju.strategy.exit_policy import decide_exit
+    from kaiju.model.calibration import CalibrationParams
     from kaiju.strategy.fairvalue import fair_prices as compute_fair_prices
+
+    # Seam callables (pmf_from_nbm_percentiles, blend_pmfs, apply_calibration,
+    # nowcast_pmf, decide_exit, select_gap_trades) are module-level and resolved
+    # via kaiju.seams (default == incumbent). CalibrationParams is the shared
+    # seam *type* (a frozen contract), not a swappable impl — imported directly.
 
     cfg: Any = settings or Settings()  # type: ignore[call-arg]
 
@@ -1344,8 +1359,8 @@ def retrain_calibration(
     - run_intraday already loads calibration via state.get_calibration(station)
       before nowcast — this function is the offline job that refreshes that row.
     """
-    from kaiju.model.calibration import fit_calibration
-
+    # fit_calibration is the module-level model/calibration seam (kaiju.seams;
+    # default == incumbent). resolve via the registry, not a direct import.
     state = State(db_path)
     state.init_schema()
 

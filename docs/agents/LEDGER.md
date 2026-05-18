@@ -26,3 +26,7 @@ tasks). A negative-result experiment is a *valid* outcome — record it
 ## Iterations
 
 <!-- loops append below this line -->
+
+```
+2026-05-18 02:14:39Z | loopA | 0001 | loop/0001-variant-registry | kaiju/seams.py, kaiju/runner.py, tests/test_seams.py | gate:pass | merged:auto-pending | gate-score Δ:n/a (infra; default==incumbent, byte-for-byte no behavior change) | next:0002
+```
