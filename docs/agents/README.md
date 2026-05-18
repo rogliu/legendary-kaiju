@@ -19,9 +19,9 @@ contract is `LOOP.md`; this explains the directory mechanics.
 ```
 backlog/NNNN-slug.md
   → git mv → in-progress/<loop-id>/NNNN-slug.md   (claim = lock)
-  → work the task on branch loop/NNNN-slug (see CONTRIBUTING.md)
-  → git mv → done/NNNN-slug.md                    (close)
-  → append one line to LEDGER.md
+  → work on branch loop/NNNN-slug (TDD; see CONTRIBUTING.md)
+  → git mv → done/NNNN-slug.md  +  LEDGER.md line  (same commit)
+  → open PR → gh pr merge --auto → GitHub merges on green (no direct push)
 ```
 
 If two loops race the same `git mv`, exactly one wins (the other's move

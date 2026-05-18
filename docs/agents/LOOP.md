@@ -20,16 +20,20 @@ An iteration is **one bounded, reviewed, reverted-or-merged change**. Exactly:
 4. **Gate.** Run `make check` (pytest + ruff + mypy). It must be fully green.
 5. **Self-check against `docs/INVARIANTS.md`.** Did this touch a danger zone?
    Weaken any test/assertion? Widen scope? If yes → Stop & Escalate (below).
-6. **Merge only if green.** Fast-forward/rebase onto `main`, `make check` green
-   on the merge result, then merge. `main` must always stay runnable.
+6. **Open a PR; let CI merge it.** Push the branch, `gh pr create --fill
+   --base main`, then `gh pr merge --auto --squash`. `main` is branch-
+   protected — you cannot (and must not) push to it directly. GitHub merges
+   automatically the instant required CI is green; a red PR never merges. Do
+   not block the loop waiting — record the PR and continue; auto-merge fires
+   async. `main` always stays runnable because nothing red can land.
 7. **Record.** Append one line to `docs/agents/LEDGER.md`: timestamp, loop-id,
    task, branch, files, gate result, merged?, gate-score delta, next.
 8. **End the iteration.** Move the task file to `docs/agents/done/`. Pick the
    next task, or stop.
 
-> The backlog / in-progress / done / LEDGER.md machinery ships in the scale-out
-> tier. Until it exists, a single loop runs steps 2–7 against an explicit task
-> the human handed it, and records progress in the commit log.
+> The backlog / in-progress / done / LEDGER.md machinery and CI branch
+> protection are in place (scale-out tier shipped). Steps 1–8 are live as
+> written.
 
 ## Hard rules (non-negotiable)
 
@@ -80,9 +84,11 @@ The model that makes "tons of agents" safe rather than terrifying:
   is an atomic lock; two loops cannot grab the same task.
 - **Module ownership.** The backlog is curated so concurrently-claimable tasks
   do not share files; each task declares its conflict scope.
-- **`main` + required-green CI is the only serialization point.** Loops rebase
-  on `main`; CI re-runs `make check`; `main` is never broken. CI — not a human
-  — is the trust boundary for an unsupervised merge.
+- **Branch-protected `main` + required-green CI is the only serialization
+  point.** Loops never push `main`; they open PRs and GitHub auto-merges on
+  green (status checks are `strict` — GitHub serializes and auto-updates
+  behind-the-base PRs). CI — not a human — is the trust boundary for an
+  unsupervised merge; danger-zone PRs additionally block on Code Owner review.
 - **The promotion gate is the scoreboard.** When loops explore competing
   strategy/model variants behind the stable seams (`model/distribution`,
   `model/calibration`, `model/nowcast`, `strategy/edge`, `strategy/exit_policy`),

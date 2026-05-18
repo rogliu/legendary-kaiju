@@ -1,9 +1,10 @@
 name: CI
 
 # The unsupervised-merge trust boundary. With agents (not humans) producing
-# changes, a green `make check` here is what makes a merge trustworthy.
-# Recommended (a GitHub setting, not in this file): protect `main` and require
-# this workflow + Code Owners review (see .github/CODEOWNERS) before merge.
+# changes, a green run here is what makes a merge trustworthy. `main` is
+# branch-protected: PRs only, both jobs below are required, danger-zone files
+# need Code Owner review (.github/CODEOWNERS), enforced for admins too. Loops
+# open a PR and `gh pr merge --auto` — GitHub merges the instant CI is green.
 
 on:
   push:
@@ -25,23 +26,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: .env must never be tracked
+      - name: the real .env (and secret variants) must never be tracked
         run: |
-          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
-            echo "::error::.env is tracked — the Kalshi RSA key must never be committed"
+          # Templates are conventional and ALLOWED: .env.example/.sample/.template/.dist
+          # Dangerous (real secrets) — block these: exactly `.env`, or
+          # .env.local / .env.prod / .env.production / .env.secret / .env.*.local
+          bad="$(git ls-files | grep -E '(^|/)\.env(\.(local|prod|production|secret)|\..*\.local)?$' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::tracked secret env file(s): $bad — the Kalshi RSA key must never be committed; only placeholder templates like .env.example belong in git"
             exit 1
           fi
-          tracked_dotenv="$(git ls-files | grep -E '(^|/)\.env($|\.)' || true)"
-          if [ -n "$tracked_dotenv" ]; then
-            echo "::error::tracked dotenv file(s): $tracked_dotenv"
-            exit 1
-          fi
-          echo "OK: no tracked .env"
+          echo "OK: no real .env tracked (templates such as .env.example are allowed)"
       - name: warn on private-key material (non-blocking)
         run: |
+          # Exclude docs, the placeholder env template, and this workflow (self-match).
           if git grep -nI -e "BEGIN RSA PRIVATE KEY" -e "BEGIN PRIVATE KEY" \
-               -e "BEGIN OPENSSH PRIVATE KEY" -- . ':!*.md' ':!docs/**'; then
-            echo "::warning::private-key-looking text found in tracked files — verify it is a generated test key, not a real credential"
+               -e "BEGIN OPENSSH PRIVATE KEY" -- . \
+               ':(exclude)*.md' ':(exclude).env.example' \
+               ':(exclude).github/workflows/ci.yml'; then
+            echo "::warning::private-key-looking text in a tracked file — verify it is a generated test key, not a real credential"
           else
-            echo "OK: no private-key material in tracked non-doc files"
+            echo "OK: no private-key material in tracked source files"
           fi

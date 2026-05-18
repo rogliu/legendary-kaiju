@@ -14,9 +14,10 @@ rails below are *executable*. Follow them exactly.
 1. **Read `docs/INVARIANTS.md` before changing anything.** Every invariant is a
    test. If you think you must weaken/delete/work-around one — **STOP**, that is
    a human escalation, never your call.
-2. **`make check` must be fully green before any merge to `main`.** Never make
-   it pass by deleting a test, loosening an assertion, or editing a rail file.
-   Gate red → fix or revert. Never disable.
+2. **`main` is branch-protected: PRs only, CI must be green to merge.** Open a
+   PR and `gh pr merge --auto`; GitHub merges on green (you never push `main`).
+   Never make CI pass by deleting a test, loosening an assertion, or editing a
+   rail file. Red → fix or revert. Never disable.
 3. **One bounded, in-scope, test-driven change at a time.** DRY, YAGNI, TDD.
    No "while I'm here" sprawl.
 4. **Scope is locked to one market (NYC `KXHIGHNY`).** Adding a city/market is

@@ -33,16 +33,18 @@ git switch -c loop/NNNN-slug
 uv run pytest tests/path/test_x.py::test_y -v
 make check
 
-# 4. Rebase onto main, verify green on the result, merge
-git switch main && git pull --ff-only        # if remote tracking
-git switch loop/NNNN-slug && git rebase main
-make check                                    # must be green post-rebase
-git switch main && git merge --ff-only loop/NNNN-slug
-
-# 5. Record + close out
+# 4. Record + close out (same branch/commit as the change)
 #   append a line to docs/agents/LEDGER.md
 git mv docs/agents/in-progress/<loop-id>/NNNN-slug.md docs/agents/done/
-git commit
+git add -A && git commit
+
+# 5. Open a PR; CI merges it — main is branch-protected, no direct pushes
+git push -u origin loop/NNNN-slug
+gh pr create --fill --base main
+gh pr merge --auto --squash                   # GitHub merges the instant CI is green
+#   Do NOT wait synchronously. A red PR never merges; fix or close it.
+#   A danger-zone PR blocks on Code Owner review — the loop must never have
+#   opened one (Stop & Escalate first).
 ```
 
 ## Conventions
