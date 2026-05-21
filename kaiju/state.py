@@ -223,6 +223,53 @@ class State:
             ).fetchall()
         ]
 
+    def record_fill(
+        self, client_id: str, market: str, price: int, count: int
+    ) -> None:
+        """Append a fill row. Multiple fills per client_id are allowed (partial fills).
+
+        Persisting fills creates the audit trail that ``settle_day`` and the gate's
+        ``sim_pnl_usd`` metric have lacked: without this, even successful paper trades
+        leave no record that they happened. Each call adds a row — callers are expected
+        to also call ``mark_order_filled`` once the order is fully consumed.
+        """
+        self.conn.execute(
+            "INSERT INTO fills(client_id, market, price, count) VALUES(?,?,?,?)",
+            (client_id, market, price, count),
+        )
+        self.conn.commit()
+
+    def list_fills(self) -> list[dict]:
+        """Return all fills ordered by timestamp ascending."""
+        return [
+            dict(r)
+            for r in self.conn.execute(
+                "SELECT * FROM fills ORDER BY ts"
+            ).fetchall()
+        ]
+
+    def get_fills_for_order(self, client_id: str) -> list[dict]:
+        """Return fills for a specific client_id ordered by timestamp ascending."""
+        return [
+            dict(r)
+            for r in self.conn.execute(
+                "SELECT * FROM fills WHERE client_id=? ORDER BY ts", (client_id,)
+            ).fetchall()
+        ]
+
+    def mark_order_filled(self, client_id: str) -> None:
+        """Flip an order's status from 'submitted' to 'filled'.
+
+        Idempotent: if the row is already 'filled' the UPDATE is a no-op. If the
+        client_id doesn't exist (shouldn't happen given the ``record_order`` →
+        ``record_fill`` → ``mark_order_filled`` ordering) the UPDATE affects 0 rows
+        silently — callers should not rely on this for existence checks.
+        """
+        self.conn.execute(
+            "UPDATE orders SET status='filled' WHERE client_id=?", (client_id,)
+        )
+        self.conn.commit()
+
     def record_pnl(self, climate_date: str, realized_usd: float, mode: str) -> None:
         """Upsert a pnl row for the given climate_date.
 

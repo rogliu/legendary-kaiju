@@ -42,12 +42,12 @@ entries for that market are allowed. Failure to call this makes every market per
 blocked after its first shadow-paper order and renders all paper-proof gate metrics
 invalid. This call mirrors what the live WS fill handler does on receipt of a fill event.
 
-YAGNI: only PaperBook and simulate_fills are exported. No new State methods. No other
-file modifications.
+YAGNI: only PaperBook and simulate_fills are exported.
 
-State.record_fill: The fills table exists in the schema but State has no record_fill
-method as of Task 16. Persisting fills is therefore skipped in this module; if a
-record_fill method is added to State later, wire it in here.
+Fill persistence: each successful fill is recorded via State.record_fill and the
+originating order is flipped to status='filled' via State.mark_order_filled.
+This is what gives settle_day and the gate an audit trail of what paper trades
+actually happened.
 """
 
 from __future__ import annotations
@@ -156,8 +156,9 @@ def simulate_fills(
       same-direction as any existing position within a climate day. Opposite-side
       netting is handled conservatively (net counts, remainder takes fill price)
       but should not arise in normal v1 operation.
-    - Fills are NOT persisted to the fills table because State has no record_fill
-      method as of Task 16. Wire this in if record_fill is added later.
+    - Each fill is persisted to the fills table and the originating order's
+      status is flipped to 'filled' (in line with the "any filled fully consumes
+      the working order" rule above).
 
     Args:
         pm: PositionManager (must be in shadow-paper or backtest mode).
@@ -170,6 +171,7 @@ def simulate_fills(
     filled_count = 0
 
     for row in pm.state.list_working_orders():
+        client_id: str = row["client_id"]
         market: str = row["market"]
         side: str = row["side"]
         price: int = row["price"]
@@ -220,8 +222,12 @@ def simulate_fills(
         # Wholesale-replace the position row with post-aggregation totals.
         pm.state.upsert_position(market, new_side, new_count, new_avg, climate_date)
 
-        # NOTE: State has no record_fill method as of Task 16; fill persistence
-        # is intentionally skipped. Add here if record_fill is introduced later.
+        # Persist the fill and mark the order filled — without this, settle_day
+        # and the gate have no audit trail of what actually traded. v1 treats any
+        # filled > 0 as fully consuming the working order (see "Partial-fill
+        # requeue" in the module docstring), so we mark the order filled now.
+        pm.state.record_fill(client_id, market, fill_price, fill_qty)
+        pm.state.mark_order_filled(client_id)
 
         # CRITICAL: release the one-in-flight guard so this market can accept
         # new orders on the next tick. This mirrors the live WS fill handler.
