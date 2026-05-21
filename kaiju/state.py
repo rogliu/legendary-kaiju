@@ -125,6 +125,11 @@ class State:
         )
         self.conn.commit()
 
+    def delete_position(self, market: str) -> None:
+        """Remove a position row (used when the broker reports the market flat)."""
+        self.conn.execute("DELETE FROM positions WHERE market=?", (market,))
+        self.conn.commit()
+
     def get_position(self, market: str) -> Optional[dict]:
         r = self.conn.execute(
             "SELECT * FROM positions WHERE market=?", (market,)
