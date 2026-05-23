@@ -10,6 +10,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "block-danger-zones.sh"
 
@@ -34,9 +36,6 @@ def test_hook_blocks_risk_dir() -> None:
     result = _invoke("kaiju/risk/limits.py")
     assert result.returncode == 2, result.stderr
     assert "rail file" in result.stderr.lower()
-
-
-import pytest
 
 
 @pytest.mark.parametrize(
