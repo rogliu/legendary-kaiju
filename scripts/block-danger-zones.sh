@@ -17,7 +17,14 @@ block() {
 }
 
 case "$rel" in
-  kaiju/risk/*) block "$rel" "real-money risk gate; must stay fail-closed" ;;
+  kaiju/risk/*)              block "$rel" "real-money risk gate; must stay fail-closed" ;;
+  kaiju/eval/gate.py)        block "$rel" "live-trading promotion gate" ;;
+  kaiju/config.py)           block "$rel" "live-path guard + secrets handling" ;;
+  kaiju/markets/parser.py)   block "$rel" "settlement map + band boundary rules" ;;
+  docs/INVARIANTS.md)        block "$rel" "executable rail spec — only humans weaken invariants" ;;
+  docs/agents/LOOP.md)       block "$rel" "loop contract — only humans alter the iteration model" ;;
+  AGENTS.md)                 block "$rel" "prime directives — only humans alter rails" ;;
+  tests/test_scope_lock.py)  block "$rel" "scope-lock test enforces single-market rule" ;;
 esac
 
 exit 0
