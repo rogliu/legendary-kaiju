@@ -299,34 +299,48 @@ class PositionManager:
         reflected in positions.  Only markets the broker reported are cleared;
         genuinely-still-pending orders for other markets are untouched.
 
-        Field mapping from broker response dict:
-          - ``ticker``           → market  (test keys + UNVERIFIED for live API)
-          - ``side``             → side    (test keys; live API: UNVERIFIED — real
-                                            MarketPosition uses ``position_fp`` sign
-                                            convention, not a ``side`` string field)
-          - ``count``            → count   (test keys; UNVERIFIED for live API —
-                                            real API uses ``position_fp`` FixedPoint)
-          - ``avg_entry_cents``  → avg_entry_cents (UNVERIFIED — not a documented
-                                            field in kalshi-api-contract.md section 3.7;
-                                            real API has ``total_traded_dollars`` /
-                                            ``market_exposure_dollars`` but no explicit
-                                            avg_entry_cents field)
-          - ``climate_date``     → climate_date (UNVERIFIED — not in Kalshi API;
-                                            kaiju-specific metadata)
+        Field mapping from the real Kalshi ``MarketPosition``
+        (kalshi-api-contract.md §3.7) — the API does NOT carry
+        ``side``/``count``/``avg_entry_cents`` string fields:
+          - ``ticker``                  → market
+          - ``position_fp`` (signed)    → side  (>0 ⇒ "yes", <0 ⇒ "no")
+                                          + count (absolute value)
+          - ``market_exposure_dollars`` → avg_entry_cents
+                                          (aggregate cost / count, in cents)
+          - climate_date is kaiju-specific metadata absent from the API;
+            the local row's value is preserved across reconnects so reconcile
+            never wipes it (a WS reconnect calls this constantly).
 
-        For the real KalshiClient, a translation layer will be needed to
-        convert ``position_fp`` sign to (side, count) and derive
-        avg_entry_cents from fill history or exposure dollars.
+        A flat position (``position_fp`` == 0) is skipped — no phantom row is
+        written — but its working orders are still cleared, since the broker
+        being flat means any pending order's fate is already resolved.
         """
         broker_positions = self.kalshi.get_positions()
         for bp in broker_positions:
+            ticker = bp["ticker"]
+            count = int(float(bp["position_fp"]))
+            if count == 0:
+                # Flat at the broker: drop any stale local row (broker is
+                # source of truth — a leftover row would make exit logic try
+                # to sell a position that no longer exists) and clear its
+                # working orders.
+                self.state.delete_position(ticker)
+                self.clear_working_orders_for_market(ticker)
+                continue
+            side = "yes" if count > 0 else "no"
+            count = abs(count)
+            exposure_dollars = float(bp["market_exposure_dollars"])
+            avg_entry_cents = round(exposure_dollars * 100 / count)
+            # API has no climate_date — preserve the local row's metadata.
+            existing = self.state.get_position(ticker)
+            climate_date = existing["climate_date"] if existing else ""
             self.state.upsert_position(
-                market=bp["ticker"],
-                side=bp["side"],
-                count=bp["count"],
-                avg_entry_cents=bp["avg_entry_cents"],
-                climate_date=bp.get("climate_date", ""),
+                market=ticker,
+                side=side,
+                count=count,
+                avg_entry_cents=avg_entry_cents,
+                climate_date=climate_date,
             )
             # Broker is source of truth: clear working orders for this market
             # since their fate is now reflected in the upserted position.
-            self.clear_working_orders_for_market(bp["ticker"])
+            self.clear_working_orders_for_market(ticker)

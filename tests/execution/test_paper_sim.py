@@ -51,3 +51,34 @@ def test_simulate_fills_updates_position_and_releases_market_guard(tmp_path):
     # second entry at a NEW price now allowed (market no longer guard-blocked)
     pm.execute_entries([TradeIntent("M", "yes", 60, 3, 0.7, 0.20)], "2026-05-17")
     assert len(st.list_working_orders()) == 1
+
+
+def test_simulate_fills_records_fill_and_flips_order_status(tmp_path):
+    """Each paper fill writes a fills row and marks orders.status='filled'.
+
+    Without this, settle_day and the gate can't see what actually traded — the
+    bot's bookkeeping silently loses every paper round-trip.
+    """
+    pm, st = _pm(tmp_path)
+    pm.execute_entries([TradeIntent("M", "yes", 55, 2, 0.7, 0.15)], "2026-05-17")
+    # Grab the client_id of the working order so we can verify its status flip.
+    working = st.list_working_orders()
+    assert len(working) == 1
+    client_id = working[0]["client_id"]
+    assert st.get_order(client_id)["status"] == "submitted"
+    assert st.list_fills() == []
+
+    pb = PaperBook()
+    pb.update("M", yes=[[55, 100]], no=[[45, 100]])
+    n = simulate_fills(pm, pb, "2026-05-17")
+
+    assert n == 1
+    # Fill row persisted with the broker-side price (55), not the limit-price (also 55 here).
+    fills = st.list_fills()
+    assert len(fills) == 1
+    assert fills[0]["client_id"] == client_id
+    assert fills[0]["market"] == "M"
+    assert fills[0]["count"] == 2
+    assert fills[0]["price"] == 55
+    # Order status flipped.
+    assert st.get_order(client_id)["status"] == "filled"
