@@ -1021,11 +1021,13 @@ def settle_day(
         Computed over the chronologically sorted pnl rows in the trailing window.
 
     fill_rate:
-        Approximated as 1.0 (all held-to-settlement positions are "filled by
-        definition"). roundtrip_pnl_stats is not used here because fills are not
-        persisted; fill_rate=1.0 is a placeholder until fill recording lands.
-        This is conservative in the OPPOSITE direction from round-trip PnL: it
-        overstates fill rate. Task 20 should wire actual fill records.
+        Approximated as 1.0 in the gate (all held-to-settlement positions are
+        "filled by definition"). Fills ARE persisted now and are consumed for
+        round-trip PnL above, but wiring a REAL fill rate from them is deferred:
+        fill_rate is computed inside the promotion gate (eval/gate.py, a danger
+        zone), so replacing the 1.0 placeholder is a separate, human-gated task.
+        fill_rate=1.0 overstates fill rate — the opposite, non-conservative
+        direction from sim_pnl_usd.
     """
     from kaiju.markets.parser import resolve_settlement
 
