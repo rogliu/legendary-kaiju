@@ -12,22 +12,24 @@ PaperBook maintains the full resting depth (every price level -> size) per marke
 side (yes/no), seeded by an orderbook_snapshot and mutated incrementally by each
 orderbook_delta. A buy of ``side`` at ``limit_price`` is marketable against the top of
 book (the highest resting price for that side) if ``limit_price >= resting_price``.
+A sell (exit) is the mirror — marketable when ``limit_price <= resting_price`` (selling
+into the resting bid) — and it reduces the held position rather than adding to it.
 Filled quantity = min(requested count, resting size) at resting_price. This is a
 conservative taker model: we assume we lift the best offer and get partial fill if the
 offer size is smaller than our order. Exact microstructure (queue position, iceberg
 orders, price-time priority across levels) is out of scope for v1 — the model is
 intentionally simple and deterministic.
 
-Position-aggregation rule
---------------------------
-simulate_fills computes the POST-aggregation (count, avg_entry_cents) by combining the
-fill with any existing position for that market:
-- Same-direction: weighted average of avg_entry_cents; total count = existing + fill.
-- Opposite-direction (v1 simplification): net the counts; if the fill fully closes,
-  count becomes 0 (or the remainder); if excess, the remaining count takes the fill's
-  price as the new avg_entry. This case should not arise in normal v1 operation because
-  working orders for a market are placed same-direction within a climate day — documented
-  as a simplification.
+Position-update rule
+--------------------
+simulate_fills reads the originating order's action (entry=buy, exit=sell) from the
+orders ledger and updates the position accordingly:
+- Buy (entry): combine the fill with any existing position — same-direction accumulates
+  with a weighted average of avg_entry_cents (count = existing + fill); opposite-direction
+  nets the counts (v1 simplification; should not arise within a climate day).
+- Sell (exit): REDUCE the held position by the filled quantity (remaining avg_entry_cents
+  unchanged); a full exit leaves count 0. Exits never accumulate — that was the bug fixed
+  in task 0005, where exits ran through the buy model and silently grew the position.
 
 Partial-fill requeue
 ---------------------
@@ -154,13 +156,16 @@ class PaperBook:
         side: str,
         limit_price: int,
         count: int,
+        action: str = "buy",
     ) -> dict[str, int]:
         """Simulate a marketable-limit taker fill against the top of book.
 
-        A buy of ``side`` at ``limit_price`` fills against the top of book for
-        that side (the highest resting price) if ``limit_price >= resting_price``
-        (marketable). Filled quantity = min(count, resting_size). If not
-        marketable or no book exists, returns filled=0.
+        Fills against the top of book for ``side`` (the highest resting price):
+        a ``"buy"`` is marketable when ``limit_price >= resting_price``; a
+        ``"sell"`` (exit) is the mirror — marketable when
+        ``limit_price <= resting_price`` (selling into the resting bid). Filled
+        quantity = min(count, resting_size) at resting_price. If not marketable
+        or no book exists, returns filled=0.
 
         This is a conservative single-level taker model. Queue position and
         multi-level sweeps are out of scope for v1.
@@ -169,7 +174,8 @@ class PaperBook:
             market: Market ticker.
             side: "yes" or "no".
             limit_price: Our limit price in cents (0-99).
-            count: Number of contracts we want to buy.
+            count: Number of contracts to transact.
+            action: "buy" (entry) or "sell" (exit).
 
         Returns:
             {"filled": int, "price": int} — filled=0 and price=0 if no fill.
@@ -180,8 +186,12 @@ class PaperBook:
 
         resting_price = max(levels)  # top of book = highest resting price
         resting_size = levels[resting_price]
-        if limit_price < resting_price:
-            # Not marketable.
+        marketable = (
+            limit_price <= resting_price
+            if action == "sell"
+            else limit_price >= resting_price
+        )
+        if not marketable:
             return {"filled": 0, "price": 0}
 
         filled = min(count, resting_size)
@@ -234,16 +244,34 @@ def simulate_fills(
         price: int = row["price"]
         count: int = row["count"]
 
-        result = book.try_fill(market, side, limit_price=price, count=count)
+        # Direction lives on the originating order (entry=buy, exit=sell).
+        order = pm.state.get_order(client_id)
+        action = (order or {}).get("action") or "buy"
+
+        result = book.try_fill(
+            market, side, limit_price=price, count=count, action=action
+        )
         if result["filled"] <= 0:
             continue
 
         fill_qty: int = result["filled"]
         fill_price: int = result["price"]
 
-        # Compute POST-aggregation position (weighted avg, same-direction assumed).
+        # Compute the POST-fill position.
         existing = pm.state.get_position(market)
-        if existing is None:
+        if action == "sell":
+            # Exit: REDUCE the held position by the filled quantity — never grow
+            # it. Remaining cost basis (avg_entry_cents) is unchanged; a full
+            # exit leaves count 0 (recorded, not deleted, so held-to-settlement
+            # scores 0 for it and round-trip PnL is attributed from the fills).
+            if existing is None:
+                # No position to reduce; an exit is only placed when one exists.
+                # Skip without recording a phantom fill.
+                continue
+            new_count = max(0, existing["count"] - fill_qty)
+            new_avg = existing["avg_entry_cents"]
+            new_side = existing["side"]
+        elif existing is None:
             new_count = fill_qty
             new_avg = fill_price
             new_side = side

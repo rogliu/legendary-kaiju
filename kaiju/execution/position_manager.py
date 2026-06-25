@@ -174,6 +174,7 @@ class PositionManager:
                 price=intent.limit_price_cents,
                 count=intent.count,
                 mode=self.mode,
+                action="buy",
             )
             self.state.record_working_order(
                 client_id=cid,
@@ -260,6 +261,7 @@ class PositionManager:
                 price=close_price,
                 count=pos["count"],
                 mode=self.mode,
+                action="sell",
             )
             self.state.record_working_order(
                 client_id=cid,

@@ -1,4 +1,4 @@
-from kaiju.types import TradeIntent
+from kaiju.types import ExitAction, ExitDecision, TradeIntent
 from kaiju.state import State
 from kaiju.execution.position_manager import PositionManager
 from kaiju.execution.paper_sim import PaperBook, simulate_fills
@@ -177,3 +177,84 @@ def test_try_fill_tracks_top_of_book_after_delta():
     # After: top-of-book yes = 96; the same 50-limit buy is no longer marketable.
     assert pb.try_fill("M", "yes", limit_price=50, count=5)["filled"] == 0
     assert pb.try_fill("M", "yes", limit_price=96, count=5) == {"filled": 5, "price": 96}
+
+
+def test_try_fill_sell_is_marketable_at_or_below_top_of_book():
+    """A sell fills against the top-of-book bid when limit <= resting (mirror of buy)."""
+    pb = PaperBook()
+    pb.update("M", yes=[[55, 100]], no=[[45, 100]])
+    # Sell yes into the 55 bid: limit 55 <= 55 marketable; limit 60 is not.
+    assert pb.try_fill("M", "yes", limit_price=55, count=4, action="sell") == {"filled": 4, "price": 55}
+    assert pb.try_fill("M", "yes", limit_price=60, count=4, action="sell")["filled"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 0005: paper exits (sells) must REDUCE the held position, not accumulate.
+# Before this fix simulate_fills ran every working order through a buy model and
+# took the same-side "accumulate" branch, so an exit grew the position — which
+# would have made round-trip PnL (0003) double-count and inflate the gate.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_sell_closes_position_not_grows_it(tmp_path):
+    pm, st = _pm(tmp_path)
+    pm.execute_entries([TradeIntent("M", "yes", 40, 10, 0.7, 0.15)], "2026-05-17")
+    pb = PaperBook()
+    pb.update("M", yes=[[40, 100]], no=[[55, 100]])
+    simulate_fills(pm, pb, "2026-05-17")
+    assert st.get_position("M")["count"] == 10  # entry filled: 10 yes @ 40
+
+    # Exit: sell the full position into a yes bid at 55.
+    pm.execute_exits({"M": ExitDecision(ExitAction.CUT, 55, "converged")}, "2026-05-17")
+    pb.update("M", yes=[[55, 100]], no=[[45, 100]])
+    simulate_fills(pm, pb, "2026-05-17")
+    pos = st.get_position("M")
+    assert pos is not None and pos["count"] == 0  # CLOSED, not grown to 20
+
+
+def test_partial_exit_sell_reduces_count_avg_unchanged(tmp_path):
+    pm, st = _pm(tmp_path)
+    pm.execute_entries([TradeIntent("M", "yes", 40, 10, 0.7, 0.15)], "2026-05-17")
+    pb = PaperBook()
+    pb.update("M", yes=[[40, 100]], no=[[55, 100]])
+    simulate_fills(pm, pb, "2026-05-17")
+
+    # Exit order is for the full 10, but only 4 of liquidity rests on the bid.
+    pm.execute_exits({"M": ExitDecision(ExitAction.CUT, 55, "converged")}, "2026-05-17")
+    pb.update("M", yes=[[55, 4]], no=[[45, 100]])
+    simulate_fills(pm, pb, "2026-05-17")
+    pos = st.get_position("M")
+    assert pos["count"] == 6 and pos["avg_entry_cents"] == 40  # 10-4, basis unchanged
+
+
+def test_sell_fill_recorded_against_exit_order(tmp_path):
+    """The exit's sell fill is persisted and tagged 'sell' in the orders ledger."""
+    pm, st = _pm(tmp_path)
+    pm.execute_entries([TradeIntent("M", "yes", 40, 10, 0.7, 0.15)], "2026-05-17")
+    pb = PaperBook()
+    pb.update("M", yes=[[40, 100]], no=[[55, 100]])
+    simulate_fills(pm, pb, "2026-05-17")
+
+    pm.execute_exits({"M": ExitDecision(ExitAction.CUT, 55, "converged")}, "2026-05-17")
+    pb.update("M", yes=[[55, 100]], no=[[45, 100]])
+    simulate_fills(pm, pb, "2026-05-17")
+
+    # Two fills total: one buy (entry) and one sell (exit), distinguishable by
+    # the action on their originating order.
+    actions = sorted(st.get_order(f["client_id"])["action"] for f in st.list_fills())
+    assert actions == ["buy", "sell"]
+
+
+def test_two_buys_accumulate_weighted_avg(tmp_path):
+    """Regression: entries (buys) still accumulate with a weighted average."""
+    pm, st = _pm(tmp_path)
+    pm.execute_entries([TradeIntent("M", "yes", 40, 10, 0.7, 0.15)], "2026-05-17")
+    pb = PaperBook()
+    pb.update("M", yes=[[40, 100]], no=[[55, 100]])
+    simulate_fills(pm, pb, "2026-05-17")  # 10 @ 40
+
+    pm.execute_entries([TradeIntent("M", "yes", 50, 10, 0.7, 0.15)], "2026-05-17")
+    pb.update("M", yes=[[50, 100]], no=[[45, 100]])
+    simulate_fills(pm, pb, "2026-05-17")  # +10 @ 50
+    pos = st.get_position("M")
+    assert pos["count"] == 20 and pos["avg_entry_cents"] == 45

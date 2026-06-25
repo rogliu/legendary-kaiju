@@ -54,3 +54,53 @@ def test_mark_order_filled_flips_status(tmp_path):
     db.mark_order_filled("c1")
 
     assert db.get_order("c1")["status"] == "filled"
+
+
+# ---------------------------------------------------------------------------
+# Task 0005: orders carry a buy/sell action (so paper exits reduce positions and
+# settle_day can later pair round-trips). Direction is a property of the order.
+# ---------------------------------------------------------------------------
+
+
+def test_orders_record_and_read_action(tmp_path):
+    db = State(str(tmp_path / "s.sqlite"))
+    db.init_schema()
+    db.record_order(client_id="b1", market="M", side="yes", price=40, count=2,
+                    mode="shadow-paper", action="buy")
+    db.record_order(client_id="s1", market="M", side="yes", price=55, count=2,
+                    mode="shadow-paper", action="sell")
+    assert db.get_order("b1")["action"] == "buy"
+    assert db.get_order("s1")["action"] == "sell"
+
+
+def test_record_order_action_defaults_to_buy(tmp_path):
+    db = State(str(tmp_path / "s.sqlite"))
+    db.init_schema()
+    db.record_order(client_id="c1", market="M", side="yes", price=40, count=2,
+                    mode="shadow-paper")
+    assert db.get_order("c1")["action"] == "buy"
+
+
+def test_orders_action_migration_adds_column_and_is_idempotent(tmp_path):
+    """An existing orders table without `action` is migrated; re-running is safe."""
+    import sqlite3
+
+    db_path = str(tmp_path / "old.sqlite")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "CREATE TABLE orders(client_id TEXT PRIMARY KEY, market TEXT, side TEXT,"
+        " price INT, count INT, mode TEXT, status TEXT DEFAULT 'submitted',"
+        " created_at TEXT DEFAULT (datetime('now')));"
+    )
+    conn.commit()
+    conn.close()
+
+    st = State(db_path)
+    st.init_schema()  # must ALTER orders to add the action column
+    cols = [r[1] for r in st.conn.execute("PRAGMA table_info(orders)").fetchall()]
+    assert "action" in cols
+
+    st.init_schema()  # idempotent — running the migration again must not error
+    st.record_order(client_id="c1", market="M", side="yes", price=40, count=2,
+                    mode="shadow-paper", action="sell")
+    assert st.get_order("c1")["action"] == "sell"
