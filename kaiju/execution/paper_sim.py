@@ -265,8 +265,12 @@ def simulate_fills(
             # exit leaves count 0 (recorded, not deleted, so held-to-settlement
             # scores 0 for it and round-trip PnL is attributed from the fills).
             if existing is None:
-                # No position to reduce; an exit is only placed when one exists.
-                # Skip without recording a phantom fill.
+                # Unreachable on the live path: execute_exits only records an
+                # exit when a position exists, and the runner simulates fills in
+                # the same tick (no position delete in between). Defensive only —
+                # note the guard is NOT released here, so if a future caller ever
+                # deletes a position before simulating its exit, that market would
+                # stay guard-blocked. Skip without recording a phantom fill.
                 continue
             new_count = max(0, existing["count"] - fill_qty)
             new_avg = existing["avg_entry_cents"]
