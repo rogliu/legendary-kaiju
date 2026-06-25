@@ -48,8 +48,10 @@ Known v1 limitations
 ---------------------
 - Daily-loss realized-PnL source is not yet wired (Task 18 will add the pnl table).
   Until then, RiskGate's daily-loss kill is INERT. See run_intraday for loud warnings.
-- orderbook_delta WS messages are currently applied as snapshots (v1 limitation);
-  incremental delta application is deferred to a future task.
+
+orderbook_delta WS messages are applied incrementally to the PaperBook full-depth
+book (see _on_ws_event); an orphan delta (before its snapshot) is dropped and the
+market awaits a fresh snapshot rather than corrupting the book.
 """
 
 from __future__ import annotations
@@ -502,20 +504,13 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
         msg_type = evt.get("type", "")
         market_ticker = evt.get("market_ticker", "")
 
-        if msg_type in ("orderbook_snapshot", "orderbook_delta"):
-            if msg_type == "orderbook_delta":
-                # v1 limitation: delta messages are applied as snapshots.
-                # Incremental delta application is deferred to a future task.
-                log.debug(
-                    "orderbook_delta received; v1 applies snapshots only, "
-                    "delta not incrementally applied"
-                )
-
-            # Update PaperBook for shadow-paper sim.
+        if msg_type == "orderbook_snapshot":
+            # Full-state snapshot: replace the PaperBook for this market and
+            # refresh the live bid/ask (OI is preserved from the REST snapshot).
             yes_lvls = evt.get("yes_dollars_fp") or []
             no_lvls = evt.get("no_dollars_fp") or []
 
-            # Fix #4: _lvl_to_cents returns a 2-element [price_cents, size] list.
+            # _lvl_to_cents returns a 2-element [price_cents, size] list.
             def _lvl_to_cents(lvl: list) -> list[int]:
                 return [round(float(lvl[0]) * 100), int(float(lvl[1]))]
 
@@ -541,6 +536,32 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
                     volume=orig.volume,
                     open_interest=orig.open_interest,  # OI from snapshot, not WS
                 )
+
+        elif msg_type == "orderbook_delta":
+            # Incremental level change: mutate the existing PaperBook in place
+            # (contract notes §4.2). price_dollars / delta_fp are fixed-point
+            # strings; delta_fp is signed (negative = remove). A delta arriving
+            # before this market's snapshot is dropped and the market awaits a
+            # fresh snapshot (resync) rather than corrupting the book — the next
+            # snapshot (sent on (re)subscribe) restores the true state. NOTE:
+            # live_quotes is intentionally refreshed on snapshots only (the
+            # quote/fair-value path is out of this task's scope); the PaperBook
+            # carries the intraday incremental state used for fill simulation.
+            side = evt.get("side", "")
+            price_dollars = evt.get("price_dollars")
+            delta_fp = evt.get("delta_fp")
+            if side in ("yes", "no") and price_dollars is not None and delta_fp is not None:
+                price_cents = round(float(price_dollars) * 100)
+                delta_size = int(float(delta_fp))
+                applied = paper_book.apply_delta(market_ticker, side, price_cents, delta_size)
+                if not applied:
+                    log.warning(
+                        "orderbook_delta for %s before snapshot; dropped, "
+                        "awaiting fresh snapshot (resync)",
+                        market_ticker,
+                    )
+            else:
+                log.warning("malformed orderbook_delta dropped: %s", evt)
 
         elif msg_type == "fill":
             # Contract 3 (live): release guard so the market can accept new orders.

@@ -29,4 +29,5 @@ tasks). A negative-result experiment is a *valid* outcome — record it
 
 ```
 2026-05-18 02:14:39Z | loopA | 0001 | loop/0001-variant-registry | kaiju/seams.py, kaiju/runner.py, tests/test_seams.py | gate:pass | merged:auto-pending | gate-score Δ:n/a (infra; default==incumbent, byte-for-byte no behavior change) | next:0002
+2026-06-25 15:04:56Z | claude/relaxed-meitner | 0002 | claude/relaxed-meitner-fts7rl | kaiju/execution/paper_sim.py, kaiju/runner.py, tests/execution/test_paper_sim.py | gate:pass | merged:no (pushed to feature branch; no PR per session instr) | gate-score Δ:n/a (paper-book fidelity — orderbook_delta now applied incrementally; deltas were previously dropped, so shadow-paper fills now track the live book between snapshots; affects future fill sim, not a current gate metric) | next:0003 (review APPROVED; flagged follow-ups → 0004)
 ```

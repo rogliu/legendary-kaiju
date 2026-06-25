@@ -8,8 +8,10 @@ gate metrics (Brier/PnL/CRPS) are invalid because the position manager stops tra
 
 Fill model (deliberately simple / conservative)
 ------------------------------------------------
-PaperBook stores the best resting level per market and side (yes/no). A buy of ``side``
-at ``limit_price`` is marketable if ``limit_price >= resting_price`` for that side.
+PaperBook maintains the full resting depth (every price level -> size) per market and
+side (yes/no), seeded by an orderbook_snapshot and mutated incrementally by each
+orderbook_delta. A buy of ``side`` at ``limit_price`` is marketable against the top of
+book (the highest resting price for that side) if ``limit_price >= resting_price``.
 Filled quantity = min(requested count, resting size) at resting_price. This is a
 conservative taker model: we assume we lift the best offer and get partial fill if the
 offer size is smaller than our order. Exact microstructure (queue position, iceberg
@@ -59,15 +61,28 @@ if TYPE_CHECKING:
 
 
 class PaperBook:
-    """Stores the top-of-book (best level) per market per side for paper-fill simulation.
+    """Full-depth resting book per (market, side) for paper-fill simulation.
 
-    Pure and deterministic: no external I/O, no randomness. Stores only the best
-    resting level per (market, side) — KISS; additional depth levels are ignored.
+    Stores every resting price level (price_cents -> size) per market side. A
+    market is *seeded* by an ``orderbook_snapshot`` (``update``, full replace)
+    and then mutated incrementally by each ``orderbook_delta`` (``apply_delta``).
+    ``try_fill`` simulates a taker fill against the top of book. Pure and
+    deterministic: no external I/O, no randomness.
+
+    Top of book = the HIGHEST resting price for the side. The Kalshi WS snapshot
+    lists levels best-(highest-)bid-first (contract notes §4.1), so this both
+    preserves the prior top-of-book == snapshot-index-0 behaviour and is robust
+    to level ordering. Taking the highest price is also the conservative taker
+    assumption (hardest to be marketable, worst fill price), consistent with the
+    deliberately-conservative fill model documented at module level.
     """
 
     def __init__(self) -> None:
-        # _book[(market, side)] = (price_cents, size)
-        self._book: dict[tuple[str, str], tuple[int, int]] = {}
+        # _levels[(market, side)] = {price_cents: size}
+        self._levels: dict[tuple[str, str], dict[int, int]] = {}
+        # Markets seeded by a snapshot. A delta for an unseeded market is dropped
+        # (never applied to a phantom book) and the market awaits a fresh snapshot.
+        self._seeded: set[str] = set()
 
     def update(
         self,
@@ -76,21 +91,62 @@ class PaperBook:
         yes: list[list[int]],
         no: list[list[int]],
     ) -> None:
-        """Store the best resting level for each side of ``market``.
+        """Apply an ``orderbook_snapshot``: fully replace the book for ``market``.
 
-        ``yes`` and ``no`` are lists of [price_cents, size] levels ordered
-        best-first (lowest ask / highest bid first). Only the first level is
-        stored; additional depth is ignored for v1 simplicity.
+        ``yes`` and ``no`` are lists of [price_cents, size] levels. Both sides
+        are fully replaced from the snapshot — an empty list clears that side
+        (a snapshot is the authoritative full state, not a merge). Receiving a
+        snapshot seeds the market so subsequent deltas apply.
 
         Args:
             market: Market ticker string.
-            yes: Resting yes levels [[price_cents, size], ...] best-first.
-            no: Resting no levels [[price_cents, size], ...] best-first.
+            yes: Resting yes levels [[price_cents, size], ...].
+            no: Resting no levels [[price_cents, size], ...].
         """
-        if yes:
-            self._book[(market, "yes")] = (int(yes[0][0]), int(yes[0][1]))
-        if no:
-            self._book[(market, "no")] = (int(no[0][0]), int(no[0][1]))
+        self._levels[(market, "yes")] = {int(lvl[0]): int(lvl[1]) for lvl in yes}
+        self._levels[(market, "no")] = {int(lvl[0]): int(lvl[1]) for lvl in no}
+        self._seeded.add(market)
+
+    def apply_delta(
+        self,
+        market: str,
+        side: str,
+        price_cents: int,
+        delta_size: int,
+    ) -> bool:
+        """Apply one ``orderbook_delta`` incrementally to the resting book.
+
+        ``delta_size`` is signed (positive = add size at ``price_cents``,
+        negative = remove). A level whose resulting size is <= 0 is removed
+        entirely — never stored negative (contract notes §4.2).
+
+        Returns True if applied. Returns False WITHOUT mutating the book when the
+        market has not been seeded by a snapshot yet: an orphan delta must never
+        create a phantom level. The caller treats False as "await a fresh
+        snapshot" (safe resync); the next snapshot restores the true book.
+
+        Args:
+            market: Market ticker.
+            side: "yes" or "no".
+            price_cents: The price level being changed, in cents.
+            delta_size: Signed size change (negative removes).
+
+        Returns:
+            True if the delta was applied; False if dropped (market unseeded).
+        """
+        if market not in self._seeded:
+            return False
+        levels = self._levels.setdefault((market, side), {})
+        new_size = levels.get(price_cents, 0) + delta_size
+        if new_size > 0:
+            levels[price_cents] = new_size
+        else:
+            levels.pop(price_cents, None)
+        return True
+
+    def levels(self, market: str, side: str) -> dict[int, int]:
+        """Return a copy of the resting {price_cents: size} levels for a side."""
+        return dict(self._levels.get((market, side), {}))
 
     def try_fill(
         self,
@@ -99,12 +155,12 @@ class PaperBook:
         limit_price: int,
         count: int,
     ) -> dict[str, int]:
-        """Simulate a marketable-limit taker fill against the resting book.
+        """Simulate a marketable-limit taker fill against the top of book.
 
-        A buy of ``side`` at ``limit_price`` fills against the best resting level
-        for that side if ``limit_price >= resting_price`` (marketable). Filled
-        quantity = min(count, resting_size). If not marketable or no book entry
-        exists, returns filled=0.
+        A buy of ``side`` at ``limit_price`` fills against the top of book for
+        that side (the highest resting price) if ``limit_price >= resting_price``
+        (marketable). Filled quantity = min(count, resting_size). If not
+        marketable or no book exists, returns filled=0.
 
         This is a conservative single-level taker model. Queue position and
         multi-level sweeps are out of scope for v1.
@@ -118,11 +174,12 @@ class PaperBook:
         Returns:
             {"filled": int, "price": int} — filled=0 and price=0 if no fill.
         """
-        entry = self._book.get((market, side))
-        if entry is None:
+        levels = self._levels.get((market, side))
+        if not levels:
             return {"filled": 0, "price": 0}
 
-        resting_price, resting_size = entry
+        resting_price = max(levels)  # top of book = highest resting price
+        resting_size = levels[resting_price]
         if limit_price < resting_price:
             # Not marketable.
             return {"filled": 0, "price": 0}

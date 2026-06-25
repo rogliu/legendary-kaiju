@@ -82,3 +82,98 @@ def test_simulate_fills_records_fill_and_flips_order_status(tmp_path):
     assert fills[0]["price"] == 55
     # Order status flipped.
     assert st.get_order(client_id)["status"] == "filled"
+
+
+# ---------------------------------------------------------------------------
+# Task 0002: incremental orderbook_delta application (full-depth book)
+#
+# Before this task PaperBook stored only top-of-book and deltas were dropped,
+# so the shadow-paper book silently diverged from the real stream between
+# snapshots — biasing simulated fills and thus the paper-proof. These tests
+# pin: snapshots fully replace, deltas mutate incrementally (add / modify /
+# remove-to-zero), an orphan delta never corrupts the book, and top-of-book
+# (what try_fill uses) tracks the resulting levels.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_stores_full_depth_not_just_top():
+    pb = PaperBook()
+    pb.update("M", yes=[[96, 100], [95, 30]], no=[[3, 50]])
+    assert pb.levels("M", "yes") == {96: 100, 95: 30}
+    assert pb.levels("M", "no") == {3: 50}
+
+
+def test_delta_modifies_existing_level_incrementally():
+    pb = PaperBook()
+    pb.update("M", yes=[[96, 100], [95, 30]], no=[[3, 50]])
+    applied = pb.apply_delta("M", "yes", 96, 50)  # +50 at an existing level
+    assert applied is True
+    # Incremental: 96 grew to 150 and the 95 level is untouched. A wholesale
+    # replace-with-payload (the old bug) would have wiped the 95 level.
+    assert pb.levels("M", "yes") == {96: 150, 95: 30}
+
+
+def test_delta_adds_new_level():
+    pb = PaperBook()
+    pb.update("M", yes=[[96, 100]], no=[[3, 50]])
+    pb.apply_delta("M", "yes", 94, 25)  # a new price level appears
+    assert pb.levels("M", "yes") == {96: 100, 94: 25}
+
+
+def test_delta_adds_level_on_seeded_side_absent_from_snapshot():
+    pb = PaperBook()
+    pb.update("M", yes=[[96, 100]], no=[[3, 50]])
+    pb.apply_delta("M", "no", 5, 20)  # 'no' side present; add a deeper level
+    assert pb.levels("M", "no") == {3: 50, 5: 20}
+
+
+def test_delta_removes_level_at_zero():
+    pb = PaperBook()
+    pb.update("M", yes=[[96, 100], [95, 30]], no=[[3, 50]])
+    pb.apply_delta("M", "yes", 96, -100)  # exactly to zero -> level removed
+    assert pb.levels("M", "yes") == {95: 30}
+
+
+def test_delta_overdraw_removes_level_never_negative():
+    pb = PaperBook()
+    pb.update("M", yes=[[96, 100]], no=[[3, 50]])
+    pb.apply_delta("M", "yes", 96, -250)  # more than present -> removed, not negative
+    assert pb.levels("M", "yes") == {}
+
+
+def test_delta_before_snapshot_dropped_and_book_uncorrupted():
+    """Orphan delta (market not seeded) must NOT create a phantom level."""
+    pb = PaperBook()
+    applied = pb.apply_delta("M", "yes", 96, 50)
+    assert applied is False  # signalled: needs resync (await fresh snapshot)
+    assert pb.levels("M", "yes") == {}  # book uncorrupted
+    assert pb.try_fill("M", "yes", limit_price=99, count=5)["filled"] == 0
+
+
+def test_snapshot_fully_replaces_book():
+    pb = PaperBook()
+    pb.update("M", yes=[[96, 100]], no=[[3, 50]])
+    pb.update("M", yes=[[50, 20]], no=[[40, 10]])  # a later full snapshot
+    assert pb.levels("M", "yes") == {50: 20}  # old 96 level gone (full replace)
+    assert pb.levels("M", "no") == {40: 10}
+
+
+def test_snapshot_with_empty_side_clears_that_side():
+    """A snapshot is the full authoritative state: an empty side clears stale depth."""
+    pb = PaperBook()
+    pb.update("M", yes=[[96, 100]], no=[[3, 50]])
+    pb.update("M", yes=[[95, 80]], no=[])  # snapshot now reports no 'no' levels
+    assert pb.levels("M", "yes") == {95: 80}
+    assert pb.levels("M", "no") == {}  # fully replaced — stale 'no' depth gone
+
+
+def test_try_fill_tracks_top_of_book_after_delta():
+    """A delta adding a higher resting level moves the price try_fill uses."""
+    pb = PaperBook()
+    pb.update("M", yes=[[50, 100]], no=[[3, 50]])
+    # Before: top-of-book yes = 50; a buy at 50 is marketable.
+    assert pb.try_fill("M", "yes", limit_price=50, count=5) == {"filled": 5, "price": 50}
+    pb.apply_delta("M", "yes", 96, 10)  # a higher resting level appears
+    # After: top-of-book yes = 96; the same 50-limit buy is no longer marketable.
+    assert pb.try_fill("M", "yes", limit_price=50, count=5)["filled"] == 0
+    assert pb.try_fill("M", "yes", limit_price=96, count=5) == {"filled": 5, "price": 96}
