@@ -864,6 +864,57 @@ def _pmf_from_members(members: list[float]):
 # Settlement + PnL + gate update (Task 18)
 # ---------------------------------------------------------------------------
 
+def _roundtrip_realized_usd(state: State, event_ticker: str) -> float:
+    """Realized PnL from intraday buy->sell round-trips for one day's markets.
+
+    Scoped to markets under ``event_ticker`` (the settled day's event; fills carry
+    no climate_date, but the market ticker encodes the date). Per market, fills are
+    split into buys (entries) and sells (exits) by the originating order's
+    ``action`` (orders.action, task 0005); the closed quantity = min(total bought,
+    total sold) realizes ``closed * (avg_sell - avg_buy)``.
+
+    DISTINCT from, and non-overlapping with, held-to-settlement scoring: a sold
+    contract has already left the position (task 0005 reduces the position on a
+    paper exit), so it is scored here exactly once and never again at settlement.
+
+    Caveats (inherited from the paper fill model, not introduced here): fill prices
+    are the simulated top-of-book paper-fill prices and fees are excluded — the same
+    conventions held-to-settlement uses. The fill model fills entries at the bid, an
+    optimistic lean that affects held-to-settlement too; a conservative spread-aware
+    fill model is a separate follow-up (see paper_sim.py).
+    """
+    prefix = event_ticker + "-"
+    # market -> {bought, buy_cost_cents, sold, sell_proceeds_cents}
+    tallies: dict[str, dict[str, int]] = {}
+    for fill in state.list_fills():
+        market = fill["market"]
+        if not market.startswith(prefix):
+            continue
+        order = state.get_order(fill["client_id"])
+        action = (order or {}).get("action") or "buy"
+        price = int(fill["price"])
+        qty = int(fill["count"])
+        tally = tallies.setdefault(
+            market, {"bought": 0, "buy_cost": 0, "sold": 0, "proceeds": 0}
+        )
+        if action == "sell":
+            tally["sold"] += qty
+            tally["proceeds"] += price * qty
+        else:
+            tally["bought"] += qty
+            tally["buy_cost"] += price * qty
+
+    realized_usd = 0.0
+    for tally in tallies.values():
+        bought, sold = tally["bought"], tally["sold"]
+        if bought <= 0 or sold <= 0:
+            continue
+        closed = min(bought, sold)
+        # avg_sell - avg_buy kept as exact floats to avoid per-cent rounding bias.
+        realized_usd += closed * (tally["proceeds"] / sold - tally["buy_cost"] / bought) / 100.0
+    return realized_usd
+
+
 def settle_day(
     station: str,
     climate_date: str,
@@ -930,11 +981,12 @@ def settle_day(
         pnl_per_contract = (100 - payoff_yes_cents) - avg_entry_cents.
       - realized_usd = sum(count * pnl_per_contract) / 100.0 over all positions.
 
-    KNOWN LIMITATION: Intraday round-trip realized PnL is NOT captured here
-    because fill records are not persisted (record_fill is absent in State v1).
-    This means the gate's sim_pnl_usd reflects ONLY held-to-settlement outcomes.
-    This is a known gate-honesty caveat: gate metrics are conservative (may
-    undercount profitable intraday exits) and should be revisited in Task 20.
+    Intraday round-trip realized PnL IS captured (task 0003): closed buy->sell
+    round-trips for this day's markets are scored from persisted fills via
+    _roundtrip_realized_usd and added to realized_usd, distinct from the
+    held-to-settlement scoring above (a sold contract has already left the
+    position, so the two never overlap). Fill prices are the simulated paper-fill
+    prices and fees are excluded — the same conventions held-to-settlement uses.
 
     Gate metric definitions
     -----------------------
@@ -962,7 +1014,7 @@ def settle_day(
 
     sim_pnl_usd:
         Sum of realized_usd from all pnl rows in the trailing window.
-        Held-to-settlement only (round-trip gap documented above).
+        Includes held-to-settlement plus intraday round-trip PnL (task 0003).
 
     max_drawdown_usd:
         Maximum drawdown of the cumulative pnl series (peak-to-trough).
@@ -1073,6 +1125,16 @@ def settle_day(
             pnl_per_contract = payoff_no_cents - avg_entry_cents
 
         realized_usd += count * pnl_per_contract / 100.0
+
+    # --- Add intraday round-trip realized PnL (task 0003) ---
+    # Closed buy->sell round-trips for this day's markets, scored from persisted
+    # fills. Distinct from the held-to-settlement loop above: a sold contract has
+    # already left the position (task 0005), so it is never double-counted at
+    # settlement. Computed only on this first-settle path; the idempotency guard
+    # above preserves the persisted total on any re-run (B5).
+    realized_usd += _roundtrip_realized_usd(
+        state, _event_ticker(series_ticker, climate_date)
+    )
 
     # --- Write pnl row (activates RiskGate daily-loss limit) ---
     # Columns: climate_date (PK), realized_usd, mode.
