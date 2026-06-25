@@ -106,7 +106,7 @@ def test_malformed_delta_drops_and_warns_without_raising(bad, caplog):
     """A delta rejected by the presence/side guard (side not in {yes,no}, or an
     absent price_dollars/delta_fp) is dropped with a WARNING and does NOT raise —
     the book is left exactly as seeded. (A present-but-non-numeric numeric field
-    is a different, pre-existing escaping case; see task 0006.)"""
+    takes the parse-error path instead — see the next test.)"""
     book = _seeded_book()
     evt = _delta()
     for k, v in bad.items():
@@ -117,5 +117,29 @@ def test_malformed_delta_drops_and_warns_without_raising(bad, caplog):
     with caplog.at_level(logging.WARNING):
         _apply_orderbook_delta(book, evt)  # must not raise
     assert book.levels(MARKET, "yes") == {96: 100}
+    assert book.levels(MARKET, "no") == {4: 100}
+    assert "malformed orderbook_delta dropped" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"price_dollars": "abc"},          # non-numeric price string -> ValueError
+        {"price_dollars": "0.9x"},         # partially-numeric price -> ValueError
+        {"delta_fp": "not-a-number"},      # non-numeric size string -> ValueError
+        {"delta_fp": ["x"]},               # wrong type entirely -> TypeError
+    ],
+)
+def test_nonnumeric_delta_field_drops_and_warns_without_raising(bad, caplog):
+    """Task 0006: a present-but-non-numeric price_dollars/delta_fp passes the
+    presence guard but cannot be parsed. It must be dropped with the same
+    'malformed orderbook_delta dropped' WARNING, NOT raise. A raise would escape
+    _on_ws_event, be caught by WsClient.run_forever as a connection error, and
+    bounce the ENTIRE WS connection (full reconnect + re-snapshot of every
+    market) over one bad field — a large over-reaction to malformed wire data."""
+    book = _seeded_book()
+    with caplog.at_level(logging.WARNING):
+        _apply_orderbook_delta(book, _delta(**bad))  # must not raise
+    assert book.levels(MARKET, "yes") == {96: 100}  # unmutated
     assert book.levels(MARKET, "no") == {4: 100}
     assert "malformed orderbook_delta dropped" in caplog.text

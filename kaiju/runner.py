@@ -306,35 +306,44 @@ def _open_exposure(positions: dict) -> float:
 def _apply_orderbook_delta(paper_book: "PaperBook", evt: dict) -> None:
     """Apply one normalized ``orderbook_delta`` WS event to the PaperBook in place.
 
-    Extracted verbatim from the ``run_intraday`` WS handler (``_on_ws_event``) so
-    the wire parse and both drop paths are unit-testable (task 0004); behaviour is
-    unchanged.
+    The ``orderbook_delta`` branch of the ``run_intraday`` WS handler
+    (``_on_ws_event``), extracted to module level so the wire parse and the drop
+    paths are unit-testable (task 0004).
 
     ``price_dollars`` / ``delta_fp`` are fixed-point strings; ``delta_fp`` is signed
     (negative = remove size). The parse mirrors the snapshot helpers: price dollars
     -> cents via ``round(float(...) * 100)`` (round, NOT truncate), signed size via
     ``int(float(...))``.
 
-    Two drop paths, each logged at WARNING:
-      - malformed delta -- ``side`` not in {"yes","no"}, or ``price_dollars`` /
-        ``delta_fp`` absent (None) -- dropped, book untouched;
+    Drop paths, each logged at WARNING; NONE raise:
+      - malformed delta -- ``side`` not in {"yes","no"}, ``price_dollars`` /
+        ``delta_fp`` absent (None), or present but unparseable as a number --
+        dropped, book untouched;
       - orphan delta (``apply_delta`` returns False: market not yet snapshotted)
         -> dropped, market awaits a fresh snapshot (resync) rather than having a
         phantom level created.
 
-    Scope note: the guard checks PRESENCE, not numeric validity. A present-but-
-    non-numeric ``price_dollars`` / ``delta_fp`` (a wire-protocol violation) passes
-    the guard and raises ``ValueError`` at ``float()`` -- unchanged from the
-    pre-extraction inline code. Hardening that (catch + WARNING-drop) is a
-    behavior change tracked separately (task 0006), not part of this coverage task.
+    The parse is wrapped (task 0006) so a present-but-non-numeric field (a wire-
+    protocol violation) is dropped like a missing field rather than raising: a
+    raise here would escape ``_on_ws_event``, and ``WsClient.run_forever`` would
+    treat it as a connection error and bounce the whole WS (full reconnect +
+    re-snapshot of every market) over a single bad delta.
     """
     market_ticker = evt.get("market_ticker", "")
     side = evt.get("side", "")
     price_dollars = evt.get("price_dollars")
     delta_fp = evt.get("delta_fp")
     if side in ("yes", "no") and price_dollars is not None and delta_fp is not None:
-        price_cents = round(float(price_dollars) * 100)
-        delta_size = int(float(delta_fp))
+        try:
+            price_cents = round(float(price_dollars) * 100)
+            delta_size = int(float(delta_fp))
+        except (ValueError, TypeError):
+            # Present but unparseable (wire-protocol violation): drop like a
+            # missing field. Must NOT propagate -- a raise escapes _on_ws_event
+            # and WsClient.run_forever treats it as a connection error, bouncing
+            # the whole WS (reconnect + re-snapshot) over one bad delta (task 0006).
+            log.warning("malformed orderbook_delta dropped: %s", evt)
+            return
         applied = paper_book.apply_delta(market_ticker, side, price_cents, delta_size)
         if not applied:
             log.warning(
