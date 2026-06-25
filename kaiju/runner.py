@@ -68,6 +68,7 @@ from kaiju.types import ExitAction, ExitDecision
 
 if TYPE_CHECKING:
     from kaiju.model.calibration import CalibrationParams
+    from kaiju.execution.paper_sim import PaperBook
 
 # Seam callables resolve through the per-seam variant registry (kaiju.seams).
 # The default variant IS the incumbent (same function object), so behaviour is
@@ -301,6 +302,43 @@ def _open_exposure(positions: dict) -> float:
 # ---------------------------------------------------------------------------
 # Production wiring (heavy imports deferred)
 # ---------------------------------------------------------------------------
+
+def _apply_orderbook_delta(paper_book: "PaperBook", evt: dict) -> None:
+    """Apply one normalized ``orderbook_delta`` WS event to the PaperBook in place.
+
+    Extracted verbatim from the ``run_intraday`` WS handler (``_on_ws_event``) so
+    the wire parse and both drop paths are unit-testable (task 0004); behaviour is
+    unchanged.
+
+    ``price_dollars`` / ``delta_fp`` are fixed-point strings; ``delta_fp`` is signed
+    (negative = remove size). The parse mirrors the snapshot helpers: price dollars
+    -> cents via ``round(float(...) * 100)`` (round, NOT truncate), signed size via
+    ``int(float(...))``.
+
+    Two drop paths, each logged at WARNING and neither raising:
+      - malformed delta (missing/invalid ``side`` / ``price_dollars`` / ``delta_fp``)
+        -> dropped, book untouched;
+      - orphan delta (``apply_delta`` returns False: market not yet snapshotted)
+        -> dropped, market awaits a fresh snapshot (resync) rather than having a
+        phantom level created.
+    """
+    market_ticker = evt.get("market_ticker", "")
+    side = evt.get("side", "")
+    price_dollars = evt.get("price_dollars")
+    delta_fp = evt.get("delta_fp")
+    if side in ("yes", "no") and price_dollars is not None and delta_fp is not None:
+        price_cents = round(float(price_dollars) * 100)
+        delta_size = int(float(delta_fp))
+        applied = paper_book.apply_delta(market_ticker, side, price_cents, delta_size)
+        if not applied:
+            log.warning(
+                "orderbook_delta for %s before snapshot; dropped, "
+                "awaiting fresh snapshot (resync)",
+                market_ticker,
+            )
+    else:
+        log.warning("malformed orderbook_delta dropped: %s", evt)
+
 
 def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
     """Production orchestration loop for one trading day.
@@ -539,29 +577,12 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
 
         elif msg_type == "orderbook_delta":
             # Incremental level change: mutate the existing PaperBook in place
-            # (contract notes §4.2). price_dollars / delta_fp are fixed-point
-            # strings; delta_fp is signed (negative = remove). A delta arriving
-            # before this market's snapshot is dropped and the market awaits a
-            # fresh snapshot (resync) rather than corrupting the book — the next
-            # snapshot (sent on (re)subscribe) restores the true state. NOTE:
+            # (contract notes §4.2). Parse + both drop paths live in the module-
+            # level _apply_orderbook_delta (testable; see task 0004). NOTE:
             # live_quotes is intentionally refreshed on snapshots only (the
             # quote/fair-value path is out of this task's scope); the PaperBook
             # carries the intraday incremental state used for fill simulation.
-            side = evt.get("side", "")
-            price_dollars = evt.get("price_dollars")
-            delta_fp = evt.get("delta_fp")
-            if side in ("yes", "no") and price_dollars is not None and delta_fp is not None:
-                price_cents = round(float(price_dollars) * 100)
-                delta_size = int(float(delta_fp))
-                applied = paper_book.apply_delta(market_ticker, side, price_cents, delta_size)
-                if not applied:
-                    log.warning(
-                        "orderbook_delta for %s before snapshot; dropped, "
-                        "awaiting fresh snapshot (resync)",
-                        market_ticker,
-                    )
-            else:
-                log.warning("malformed orderbook_delta dropped: %s", evt)
+            _apply_orderbook_delta(paper_book, evt)
 
         elif msg_type == "fill":
             # Contract 3 (live): release guard so the market can accept new orders.
