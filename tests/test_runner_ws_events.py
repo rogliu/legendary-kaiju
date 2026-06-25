@@ -53,12 +53,17 @@ def test_delta_reduces_level_price_to_cents_and_signed_size():
 
 
 def test_delta_parse_uses_round_not_truncation():
-    """0.96 * 100 == 95.99999999999999 in float; the parse must round to 96.
-    A regression to int()/truncation would write the level at 95c and fail here."""
-    book = _seeded_book()
-    _apply_orderbook_delta(book, _delta(price_dollars="0.96", delta_fp="-1.00"))
-    assert 96 in book.levels(MARKET, "yes")
-    assert 95 not in book.levels(MARKET, "yes")
+    """The parse must ROUND price dollars to cents, not truncate. 0.29 * 100 ==
+    28.999999999999996 in float, so round() -> 29 but int() -> 28 (verified on
+    this build; 0.96 does NOT distinguish them — both give 96). A positive delta
+    at 0.29 must grow the 29c level; a regression to int()/truncation would
+    instead create a phantom 28c level and leave 29c untouched, failing BOTH
+    assertions below."""
+    book = PaperBook()
+    book.update(MARKET, yes=[[29, 100]], no=[[4, 100]])
+    _apply_orderbook_delta(book, _delta(price_dollars="0.29", delta_fp="30.00"))
+    assert book.levels(MARKET, "yes") == {29: 130}  # round -> 29c: 100 + 30
+    assert 28 not in book.levels(MARKET, "yes")      # truncation would land here
 
 
 def test_delta_adds_new_positive_level():
@@ -98,8 +103,10 @@ def test_orphan_delta_before_snapshot_drops_and_warns(caplog):
     ],
 )
 def test_malformed_delta_drops_and_warns_without_raising(bad, caplog):
-    """A malformed delta (missing/invalid field) is dropped with a WARNING and
-    never raises — the book is left exactly as seeded."""
+    """A delta rejected by the presence/side guard (side not in {yes,no}, or an
+    absent price_dollars/delta_fp) is dropped with a WARNING and does NOT raise —
+    the book is left exactly as seeded. (A present-but-non-numeric numeric field
+    is a different, pre-existing escaping case; see task 0006.)"""
     book = _seeded_book()
     evt = _delta()
     for k, v in bad.items():

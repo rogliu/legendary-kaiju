@@ -315,12 +315,18 @@ def _apply_orderbook_delta(paper_book: "PaperBook", evt: dict) -> None:
     -> cents via ``round(float(...) * 100)`` (round, NOT truncate), signed size via
     ``int(float(...))``.
 
-    Two drop paths, each logged at WARNING and neither raising:
-      - malformed delta (missing/invalid ``side`` / ``price_dollars`` / ``delta_fp``)
-        -> dropped, book untouched;
+    Two drop paths, each logged at WARNING:
+      - malformed delta -- ``side`` not in {"yes","no"}, or ``price_dollars`` /
+        ``delta_fp`` absent (None) -- dropped, book untouched;
       - orphan delta (``apply_delta`` returns False: market not yet snapshotted)
         -> dropped, market awaits a fresh snapshot (resync) rather than having a
         phantom level created.
+
+    Scope note: the guard checks PRESENCE, not numeric validity. A present-but-
+    non-numeric ``price_dollars`` / ``delta_fp`` (a wire-protocol violation) passes
+    the guard and raises ``ValueError`` at ``float()`` -- unchanged from the
+    pre-extraction inline code. Hardening that (catch + WARNING-drop) is a
+    behavior change tracked separately (task 0006), not part of this coverage task.
     """
     market_ticker = evt.get("market_ticker", "")
     side = evt.get("side", "")
