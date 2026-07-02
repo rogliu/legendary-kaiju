@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS predictions(
   PRIMARY KEY(station, climate_date));
 CREATE TABLE IF NOT EXISTS orders(
   client_id TEXT PRIMARY KEY, market TEXT, side TEXT, price INT, count INT,
-  mode TEXT, status TEXT DEFAULT 'submitted', created_at TEXT DEFAULT (datetime('now')));
+  mode TEXT, status TEXT DEFAULT 'submitted', action TEXT DEFAULT 'buy',
+  created_at TEXT DEFAULT (datetime('now')));
 CREATE TABLE IF NOT EXISTS fills(
   client_id TEXT, market TEXT, price INT, count INT, ts TEXT DEFAULT (datetime('now')));
 CREATE TABLE IF NOT EXISTS pnl(
@@ -42,7 +43,23 @@ class State:
 
     def init_schema(self) -> None:
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Idempotent column migrations for DBs created before a column existed.
+
+        ``CREATE TABLE IF NOT EXISTS`` does not add columns to a pre-existing
+        table, so a persisted ``kaiju.sqlite`` from before ``orders.action``
+        existed needs the column added explicitly. Safe to run on every startup.
+        """
+        order_cols = {
+            r[1] for r in self.conn.execute("PRAGMA table_info(orders)").fetchall()
+        }
+        if "action" not in order_cols:
+            self.conn.execute(
+                "ALTER TABLE orders ADD COLUMN action TEXT DEFAULT 'buy'"
+            )
 
     def record_prediction(
         self, station: str, climate_date: str, low_f: int, probs: list[float]
@@ -73,11 +90,17 @@ class State:
         price: int,
         count: int,
         mode: str,
+        action: str = "buy",
     ) -> None:
+        """Record an order in the idempotency ledger.
+
+        ``action`` is ``"buy"`` (entry) or ``"sell"`` (exit) — the direction the
+        paper-fill simulator and ``settle_day`` use to tell entries from exits.
+        """
         self.conn.execute(
-            "INSERT OR IGNORE INTO orders(client_id,market,side,price,count,mode)"
-            " VALUES(?,?,?,?,?,?)",
-            (client_id, market, side, price, count, mode),
+            "INSERT OR IGNORE INTO orders(client_id,market,side,price,count,mode,action)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (client_id, market, side, price, count, mode, action),
         )
         self.conn.commit()
 

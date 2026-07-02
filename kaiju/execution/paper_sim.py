@@ -8,24 +8,28 @@ gate metrics (Brier/PnL/CRPS) are invalid because the position manager stops tra
 
 Fill model (deliberately simple / conservative)
 ------------------------------------------------
-PaperBook stores the best resting level per market and side (yes/no). A buy of ``side``
-at ``limit_price`` is marketable if ``limit_price >= resting_price`` for that side.
+PaperBook maintains the full resting depth (every price level -> size) per market and
+side (yes/no), seeded by an orderbook_snapshot and mutated incrementally by each
+orderbook_delta. A buy of ``side`` at ``limit_price`` is marketable against the top of
+book (the highest resting price for that side) if ``limit_price >= resting_price``.
+A sell (exit) is the mirror — marketable when ``limit_price <= resting_price`` (selling
+into the resting bid) — and it reduces the held position rather than adding to it.
 Filled quantity = min(requested count, resting size) at resting_price. This is a
 conservative taker model: we assume we lift the best offer and get partial fill if the
 offer size is smaller than our order. Exact microstructure (queue position, iceberg
 orders, price-time priority across levels) is out of scope for v1 — the model is
 intentionally simple and deterministic.
 
-Position-aggregation rule
---------------------------
-simulate_fills computes the POST-aggregation (count, avg_entry_cents) by combining the
-fill with any existing position for that market:
-- Same-direction: weighted average of avg_entry_cents; total count = existing + fill.
-- Opposite-direction (v1 simplification): net the counts; if the fill fully closes,
-  count becomes 0 (or the remainder); if excess, the remaining count takes the fill's
-  price as the new avg_entry. This case should not arise in normal v1 operation because
-  working orders for a market are placed same-direction within a climate day — documented
-  as a simplification.
+Position-update rule
+--------------------
+simulate_fills reads the originating order's action (entry=buy, exit=sell) from the
+orders ledger and updates the position accordingly:
+- Buy (entry): combine the fill with any existing position — same-direction accumulates
+  with a weighted average of avg_entry_cents (count = existing + fill); opposite-direction
+  nets the counts (v1 simplification; should not arise within a climate day).
+- Sell (exit): REDUCE the held position by the filled quantity (remaining avg_entry_cents
+  unchanged); a full exit leaves count 0. Exits never accumulate — that was the bug fixed
+  in task 0005, where exits ran through the buy model and silently grew the position.
 
 Partial-fill requeue
 ---------------------
@@ -59,15 +63,28 @@ if TYPE_CHECKING:
 
 
 class PaperBook:
-    """Stores the top-of-book (best level) per market per side for paper-fill simulation.
+    """Full-depth resting book per (market, side) for paper-fill simulation.
 
-    Pure and deterministic: no external I/O, no randomness. Stores only the best
-    resting level per (market, side) — KISS; additional depth levels are ignored.
+    Stores every resting price level (price_cents -> size) per market side. A
+    market is *seeded* by an ``orderbook_snapshot`` (``update``, full replace)
+    and then mutated incrementally by each ``orderbook_delta`` (``apply_delta``).
+    ``try_fill`` simulates a taker fill against the top of book. Pure and
+    deterministic: no external I/O, no randomness.
+
+    Top of book = the HIGHEST resting price for the side. The Kalshi WS snapshot
+    lists levels best-(highest-)bid-first (contract notes §4.1), so this both
+    preserves the prior top-of-book == snapshot-index-0 behaviour and is robust
+    to level ordering. Taking the highest price is also the conservative taker
+    assumption (hardest to be marketable, worst fill price), consistent with the
+    deliberately-conservative fill model documented at module level.
     """
 
     def __init__(self) -> None:
-        # _book[(market, side)] = (price_cents, size)
-        self._book: dict[tuple[str, str], tuple[int, int]] = {}
+        # _levels[(market, side)] = {price_cents: size}
+        self._levels: dict[tuple[str, str], dict[int, int]] = {}
+        # Markets seeded by a snapshot. A delta for an unseeded market is dropped
+        # (never applied to a phantom book) and the market awaits a fresh snapshot.
+        self._seeded: set[str] = set()
 
     def update(
         self,
@@ -76,21 +93,62 @@ class PaperBook:
         yes: list[list[int]],
         no: list[list[int]],
     ) -> None:
-        """Store the best resting level for each side of ``market``.
+        """Apply an ``orderbook_snapshot``: fully replace the book for ``market``.
 
-        ``yes`` and ``no`` are lists of [price_cents, size] levels ordered
-        best-first (lowest ask / highest bid first). Only the first level is
-        stored; additional depth is ignored for v1 simplicity.
+        ``yes`` and ``no`` are lists of [price_cents, size] levels. Both sides
+        are fully replaced from the snapshot — an empty list clears that side
+        (a snapshot is the authoritative full state, not a merge). Receiving a
+        snapshot seeds the market so subsequent deltas apply.
 
         Args:
             market: Market ticker string.
-            yes: Resting yes levels [[price_cents, size], ...] best-first.
-            no: Resting no levels [[price_cents, size], ...] best-first.
+            yes: Resting yes levels [[price_cents, size], ...].
+            no: Resting no levels [[price_cents, size], ...].
         """
-        if yes:
-            self._book[(market, "yes")] = (int(yes[0][0]), int(yes[0][1]))
-        if no:
-            self._book[(market, "no")] = (int(no[0][0]), int(no[0][1]))
+        self._levels[(market, "yes")] = {int(lvl[0]): int(lvl[1]) for lvl in yes}
+        self._levels[(market, "no")] = {int(lvl[0]): int(lvl[1]) for lvl in no}
+        self._seeded.add(market)
+
+    def apply_delta(
+        self,
+        market: str,
+        side: str,
+        price_cents: int,
+        delta_size: int,
+    ) -> bool:
+        """Apply one ``orderbook_delta`` incrementally to the resting book.
+
+        ``delta_size`` is signed (positive = add size at ``price_cents``,
+        negative = remove). A level whose resulting size is <= 0 is removed
+        entirely — never stored negative (contract notes §4.2).
+
+        Returns True if applied. Returns False WITHOUT mutating the book when the
+        market has not been seeded by a snapshot yet: an orphan delta must never
+        create a phantom level. The caller treats False as "await a fresh
+        snapshot" (safe resync); the next snapshot restores the true book.
+
+        Args:
+            market: Market ticker.
+            side: "yes" or "no".
+            price_cents: The price level being changed, in cents.
+            delta_size: Signed size change (negative removes).
+
+        Returns:
+            True if the delta was applied; False if dropped (market unseeded).
+        """
+        if market not in self._seeded:
+            return False
+        levels = self._levels.setdefault((market, side), {})
+        new_size = levels.get(price_cents, 0) + delta_size
+        if new_size > 0:
+            levels[price_cents] = new_size
+        else:
+            levels.pop(price_cents, None)
+        return True
+
+    def levels(self, market: str, side: str) -> dict[int, int]:
+        """Return a copy of the resting {price_cents: size} levels for a side."""
+        return dict(self._levels.get((market, side), {}))
 
     def try_fill(
         self,
@@ -98,13 +156,16 @@ class PaperBook:
         side: str,
         limit_price: int,
         count: int,
+        action: str = "buy",
     ) -> dict[str, int]:
-        """Simulate a marketable-limit taker fill against the resting book.
+        """Simulate a marketable-limit taker fill against the top of book.
 
-        A buy of ``side`` at ``limit_price`` fills against the best resting level
-        for that side if ``limit_price >= resting_price`` (marketable). Filled
-        quantity = min(count, resting_size). If not marketable or no book entry
-        exists, returns filled=0.
+        Fills against the top of book for ``side`` (the highest resting price):
+        a ``"buy"`` is marketable when ``limit_price >= resting_price``; a
+        ``"sell"`` (exit) is the mirror — marketable when
+        ``limit_price <= resting_price`` (selling into the resting bid). Filled
+        quantity = min(count, resting_size) at resting_price. If not marketable
+        or no book exists, returns filled=0.
 
         This is a conservative single-level taker model. Queue position and
         multi-level sweeps are out of scope for v1.
@@ -113,18 +174,24 @@ class PaperBook:
             market: Market ticker.
             side: "yes" or "no".
             limit_price: Our limit price in cents (0-99).
-            count: Number of contracts we want to buy.
+            count: Number of contracts to transact.
+            action: "buy" (entry) or "sell" (exit).
 
         Returns:
             {"filled": int, "price": int} — filled=0 and price=0 if no fill.
         """
-        entry = self._book.get((market, side))
-        if entry is None:
+        levels = self._levels.get((market, side))
+        if not levels:
             return {"filled": 0, "price": 0}
 
-        resting_price, resting_size = entry
-        if limit_price < resting_price:
-            # Not marketable.
+        resting_price = max(levels)  # top of book = highest resting price
+        resting_size = levels[resting_price]
+        marketable = (
+            limit_price <= resting_price
+            if action == "sell"
+            else limit_price >= resting_price
+        )
+        if not marketable:
             return {"filled": 0, "price": 0}
 
         filled = min(count, resting_size)
@@ -177,16 +244,38 @@ def simulate_fills(
         price: int = row["price"]
         count: int = row["count"]
 
-        result = book.try_fill(market, side, limit_price=price, count=count)
+        # Direction lives on the originating order (entry=buy, exit=sell).
+        order = pm.state.get_order(client_id)
+        action = (order or {}).get("action") or "buy"
+
+        result = book.try_fill(
+            market, side, limit_price=price, count=count, action=action
+        )
         if result["filled"] <= 0:
             continue
 
         fill_qty: int = result["filled"]
         fill_price: int = result["price"]
 
-        # Compute POST-aggregation position (weighted avg, same-direction assumed).
+        # Compute the POST-fill position.
         existing = pm.state.get_position(market)
-        if existing is None:
+        if action == "sell":
+            # Exit: REDUCE the held position by the filled quantity — never grow
+            # it. Remaining cost basis (avg_entry_cents) is unchanged; a full
+            # exit leaves count 0 (recorded, not deleted, so held-to-settlement
+            # scores 0 for it and round-trip PnL is attributed from the fills).
+            if existing is None:
+                # Unreachable on the live path: execute_exits only records an
+                # exit when a position exists, and the runner simulates fills in
+                # the same tick (no position delete in between). Defensive only —
+                # note the guard is NOT released here, so if a future caller ever
+                # deletes a position before simulating its exit, that market would
+                # stay guard-blocked. Skip without recording a phantom fill.
+                continue
+            new_count = max(0, existing["count"] - fill_qty)
+            new_avg = existing["avg_entry_cents"]
+            new_side = existing["side"]
+        elif existing is None:
             new_count = fill_qty
             new_avg = fill_price
             new_side = side

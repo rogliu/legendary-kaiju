@@ -48,8 +48,10 @@ Known v1 limitations
 ---------------------
 - Daily-loss realized-PnL source is not yet wired (Task 18 will add the pnl table).
   Until then, RiskGate's daily-loss kill is INERT. See run_intraday for loud warnings.
-- orderbook_delta WS messages are currently applied as snapshots (v1 limitation);
-  incremental delta application is deferred to a future task.
+
+orderbook_delta WS messages are applied incrementally to the PaperBook full-depth
+book (see _on_ws_event); an orphan delta (before its snapshot) is dropped and the
+market awaits a fresh snapshot rather than corrupting the book.
 """
 
 from __future__ import annotations
@@ -66,6 +68,7 @@ from kaiju.types import ExitAction, ExitDecision
 
 if TYPE_CHECKING:
     from kaiju.model.calibration import CalibrationParams
+    from kaiju.execution.paper_sim import PaperBook
 
 # Seam callables resolve through the per-seam variant registry (kaiju.seams).
 # The default variant IS the incumbent (same function object), so behaviour is
@@ -300,6 +303,58 @@ def _open_exposure(positions: dict) -> float:
 # Production wiring (heavy imports deferred)
 # ---------------------------------------------------------------------------
 
+def _apply_orderbook_delta(paper_book: "PaperBook", evt: dict) -> None:
+    """Apply one normalized ``orderbook_delta`` WS event to the PaperBook in place.
+
+    The ``orderbook_delta`` branch of the ``run_intraday`` WS handler
+    (``_on_ws_event``), extracted to module level so the wire parse and the drop
+    paths are unit-testable (task 0004).
+
+    ``price_dollars`` / ``delta_fp`` are fixed-point strings; ``delta_fp`` is signed
+    (negative = remove size). The parse mirrors the snapshot helpers: price dollars
+    -> cents via ``round(float(...) * 100)`` (round, NOT truncate), signed size via
+    ``int(float(...))``.
+
+    Drop paths, each logged at WARNING; NONE raise:
+      - malformed delta -- ``side`` not in {"yes","no"}, ``price_dollars`` /
+        ``delta_fp`` absent (None), or present but unparseable as a number --
+        dropped, book untouched;
+      - orphan delta (``apply_delta`` returns False: market not yet snapshotted)
+        -> dropped, market awaits a fresh snapshot (resync) rather than having a
+        phantom level created.
+
+    The parse is wrapped (task 0006) so a present-but-non-numeric field (a wire-
+    protocol violation) is dropped like a missing field rather than raising: a
+    raise here would escape ``_on_ws_event``, and ``WsClient.run_forever`` would
+    treat it as a connection error and bounce the whole WS (full reconnect +
+    re-snapshot of every market) over a single bad delta.
+    """
+    market_ticker = evt.get("market_ticker", "")
+    side = evt.get("side", "")
+    price_dollars = evt.get("price_dollars")
+    delta_fp = evt.get("delta_fp")
+    if side in ("yes", "no") and price_dollars is not None and delta_fp is not None:
+        try:
+            price_cents = round(float(price_dollars) * 100)
+            delta_size = int(float(delta_fp))
+        except (ValueError, TypeError):
+            # Present but unparseable (wire-protocol violation): drop like a
+            # missing field. Must NOT propagate -- a raise escapes _on_ws_event
+            # and WsClient.run_forever treats it as a connection error, bouncing
+            # the whole WS (reconnect + re-snapshot) over one bad delta (task 0006).
+            log.warning("malformed orderbook_delta dropped: %s", evt)
+            return
+        applied = paper_book.apply_delta(market_ticker, side, price_cents, delta_size)
+        if not applied:
+            log.warning(
+                "orderbook_delta for %s before snapshot; dropped, "
+                "awaiting fresh snapshot (resync)",
+                market_ticker,
+            )
+    else:
+        log.warning("malformed orderbook_delta dropped: %s", evt)
+
+
 def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
     """Production orchestration loop for one trading day.
 
@@ -502,20 +557,13 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
         msg_type = evt.get("type", "")
         market_ticker = evt.get("market_ticker", "")
 
-        if msg_type in ("orderbook_snapshot", "orderbook_delta"):
-            if msg_type == "orderbook_delta":
-                # v1 limitation: delta messages are applied as snapshots.
-                # Incremental delta application is deferred to a future task.
-                log.debug(
-                    "orderbook_delta received; v1 applies snapshots only, "
-                    "delta not incrementally applied"
-                )
-
-            # Update PaperBook for shadow-paper sim.
+        if msg_type == "orderbook_snapshot":
+            # Full-state snapshot: replace the PaperBook for this market and
+            # refresh the live bid/ask (OI is preserved from the REST snapshot).
             yes_lvls = evt.get("yes_dollars_fp") or []
             no_lvls = evt.get("no_dollars_fp") or []
 
-            # Fix #4: _lvl_to_cents returns a 2-element [price_cents, size] list.
+            # _lvl_to_cents returns a 2-element [price_cents, size] list.
             def _lvl_to_cents(lvl: list) -> list[int]:
                 return [round(float(lvl[0]) * 100), int(float(lvl[1]))]
 
@@ -541,6 +589,15 @@ def run_intraday(station: str, mode: str, *, settings: Any = None) -> None:
                     volume=orig.volume,
                     open_interest=orig.open_interest,  # OI from snapshot, not WS
                 )
+
+        elif msg_type == "orderbook_delta":
+            # Incremental level change: mutate the existing PaperBook in place
+            # (contract notes §4.2). Parse + both drop paths live in the module-
+            # level _apply_orderbook_delta (testable; see task 0004). NOTE:
+            # live_quotes is intentionally refreshed on snapshots only (the
+            # quote/fair-value path is out of this task's scope); the PaperBook
+            # carries the intraday incremental state used for fill simulation.
+            _apply_orderbook_delta(paper_book, evt)
 
         elif msg_type == "fill":
             # Contract 3 (live): release guard so the market can accept new orders.
@@ -843,6 +900,57 @@ def _pmf_from_members(members: list[float]):
 # Settlement + PnL + gate update (Task 18)
 # ---------------------------------------------------------------------------
 
+def _roundtrip_realized_usd(state: State, event_ticker: str) -> float:
+    """Realized PnL from intraday buy->sell round-trips for one day's markets.
+
+    Scoped to markets under ``event_ticker`` (the settled day's event; fills carry
+    no climate_date, but the market ticker encodes the date). Per market, fills are
+    split into buys (entries) and sells (exits) by the originating order's
+    ``action`` (orders.action, task 0005); the closed quantity = min(total bought,
+    total sold) realizes ``closed * (avg_sell - avg_buy)``.
+
+    DISTINCT from, and non-overlapping with, held-to-settlement scoring: a sold
+    contract has already left the position (task 0005 reduces the position on a
+    paper exit), so it is scored here exactly once and never again at settlement.
+
+    Caveats (inherited from the paper fill model, not introduced here): fill prices
+    are the simulated top-of-book paper-fill prices and fees are excluded — the same
+    conventions held-to-settlement uses. The fill model fills entries at the bid, an
+    optimistic lean that affects held-to-settlement too; a conservative spread-aware
+    fill model is a separate follow-up (see paper_sim.py).
+    """
+    prefix = event_ticker + "-"
+    # market -> {bought, buy_cost_cents, sold, sell_proceeds_cents}
+    tallies: dict[str, dict[str, int]] = {}
+    for fill in state.list_fills():
+        market = fill["market"]
+        if not market.startswith(prefix):
+            continue
+        order = state.get_order(fill["client_id"])
+        action = (order or {}).get("action") or "buy"
+        price = int(fill["price"])
+        qty = int(fill["count"])
+        tally = tallies.setdefault(
+            market, {"bought": 0, "buy_cost": 0, "sold": 0, "proceeds": 0}
+        )
+        if action == "sell":
+            tally["sold"] += qty
+            tally["proceeds"] += price * qty
+        else:
+            tally["bought"] += qty
+            tally["buy_cost"] += price * qty
+
+    realized_usd = 0.0
+    for tally in tallies.values():
+        bought, sold = tally["bought"], tally["sold"]
+        if bought <= 0 or sold <= 0:
+            continue
+        closed = min(bought, sold)
+        # avg_sell - avg_buy kept as exact floats to avoid per-cent rounding bias.
+        realized_usd += closed * (tally["proceeds"] / sold - tally["buy_cost"] / bought) / 100.0
+    return realized_usd
+
+
 def settle_day(
     station: str,
     climate_date: str,
@@ -909,11 +1017,12 @@ def settle_day(
         pnl_per_contract = (100 - payoff_yes_cents) - avg_entry_cents.
       - realized_usd = sum(count * pnl_per_contract) / 100.0 over all positions.
 
-    KNOWN LIMITATION: Intraday round-trip realized PnL is NOT captured here
-    because fill records are not persisted (record_fill is absent in State v1).
-    This means the gate's sim_pnl_usd reflects ONLY held-to-settlement outcomes.
-    This is a known gate-honesty caveat: gate metrics are conservative (may
-    undercount profitable intraday exits) and should be revisited in Task 20.
+    Intraday round-trip realized PnL IS captured (task 0003): closed buy->sell
+    round-trips for this day's markets are scored from persisted fills via
+    _roundtrip_realized_usd and added to realized_usd, distinct from the
+    held-to-settlement scoring above (a sold contract has already left the
+    position, so the two never overlap). Fill prices are the simulated paper-fill
+    prices and fees are excluded — the same conventions held-to-settlement uses.
 
     Gate metric definitions
     -----------------------
@@ -941,18 +1050,20 @@ def settle_day(
 
     sim_pnl_usd:
         Sum of realized_usd from all pnl rows in the trailing window.
-        Held-to-settlement only (round-trip gap documented above).
+        Includes held-to-settlement plus intraday round-trip PnL (task 0003).
 
     max_drawdown_usd:
         Maximum drawdown of the cumulative pnl series (peak-to-trough).
         Computed over the chronologically sorted pnl rows in the trailing window.
 
     fill_rate:
-        Approximated as 1.0 (all held-to-settlement positions are "filled by
-        definition"). roundtrip_pnl_stats is not used here because fills are not
-        persisted; fill_rate=1.0 is a placeholder until fill recording lands.
-        This is conservative in the OPPOSITE direction from round-trip PnL: it
-        overstates fill rate. Task 20 should wire actual fill records.
+        Approximated as 1.0 in the gate (all held-to-settlement positions are
+        "filled by definition"). Fills ARE persisted now and are consumed for
+        round-trip PnL above, but wiring a REAL fill rate from them is deferred:
+        fill_rate is computed inside the promotion gate (eval/gate.py, a danger
+        zone), so replacing the 1.0 placeholder is a separate, human-gated task.
+        fill_rate=1.0 overstates fill rate — the opposite, non-conservative
+        direction from sim_pnl_usd.
     """
     from kaiju.markets.parser import resolve_settlement
 
@@ -1052,6 +1163,16 @@ def settle_day(
             pnl_per_contract = payoff_no_cents - avg_entry_cents
 
         realized_usd += count * pnl_per_contract / 100.0
+
+    # --- Add intraday round-trip realized PnL (task 0003) ---
+    # Closed buy->sell round-trips for this day's markets, scored from persisted
+    # fills. Distinct from the held-to-settlement loop above: a sold contract has
+    # already left the position (task 0005), so it is never double-counted at
+    # settlement. Computed only on this first-settle path; the idempotency guard
+    # above preserves the persisted total on any re-run (B5).
+    realized_usd += _roundtrip_realized_usd(
+        state, _event_ticker(series_ticker, climate_date)
+    )
 
     # --- Write pnl row (activates RiskGate daily-loss limit) ---
     # Columns: climate_date (PK), realized_usd, mode.

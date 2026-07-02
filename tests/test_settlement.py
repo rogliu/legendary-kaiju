@@ -311,6 +311,125 @@ def test_settle_day_rerun_is_idempotent(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_settle_day_includes_roundtrip_pnl(tmp_path):
+    """Task 0003: a buy fill then a sell fill at a better price yields positive
+    realized round-trip PnL in settle_day's realized_usd."""
+    db = str(tmp_path / "rt.sqlite")
+    st = State(db)
+    st.init_schema()
+    market = "KXHIGHNY-26MAY17-B65"
+    # Round-trip: bought 10 @ 40, sold 10 @ 55 -> +$1.50; position fully closed.
+    st.record_order("b1", market, "yes", 40, 10, "shadow-paper", action="buy")
+    st.record_order("s1", market, "yes", 55, 10, "shadow-paper", action="sell")
+    st.record_fill("b1", market, 40, 10)
+    st.record_fill("s1", market, 55, 10)
+    st.upsert_position(market, "yes", 0, 40, "2026-05-17")  # closed by the round-trip
+    res = settle_day(
+        station="NYC", climate_date="2026-05-17", db_path=db,
+        deps=Deps(), series_ticker="KXHIGHNY", mode="shadow-paper",
+    )
+    # Held-to-settlement on a count-0 position = 0; all PnL is the round-trip.
+    assert res["realized_usd"] == pytest.approx(1.50)
+
+
+def test_settle_day_roundtrip_is_distinct_from_held(tmp_path):
+    """Round-trip PnL ADDS to held-to-settlement, on a separate market."""
+    db = str(tmp_path / "rt2.sqlite")
+    st = State(db)
+    st.init_schema()
+    st.record_prediction("NYC", "2026-05-17", 64, [0.2, 0.6, 0.2])
+    held = "KXHIGHNY-26MAY17-B66"  # held to settlement; official max 66 -> in bucket
+    st.upsert_position(held, "yes", 5, 40, "2026-05-17")  # 5*(100-40)/100 = $3.00
+    rt = "KXHIGHNY-26MAY17-B70"  # round-tripped and closed
+    st.record_order("b1", rt, "yes", 30, 4, "shadow-paper", action="buy")
+    st.record_order("s1", rt, "yes", 50, 4, "shadow-paper", action="sell")
+    st.record_fill("b1", rt, 30, 4)
+    st.record_fill("s1", rt, 50, 4)
+    st.upsert_position(rt, "yes", 0, 30, "2026-05-17")
+    res = settle_day(
+        station="NYC", climate_date="2026-05-17", db_path=db,
+        deps=Deps(), series_ticker="KXHIGHNY", mode="shadow-paper",
+    )
+    # held $3.00 + round-trip 4*(50-30)/100 = $0.80 -> $3.80
+    assert res["realized_usd"] == pytest.approx(3.80)
+
+
+def test_settle_day_partial_roundtrip_plus_held_no_double_count(tmp_path):
+    """A partial exit: the closed portion realizes round-trip PnL, the remainder
+    is held to settlement — the two never overlap (task 0005 left count = bought-sold)."""
+    db = str(tmp_path / "rt3.sqlite")
+    st = State(db)
+    st.init_schema()
+    st.record_prediction("NYC", "2026-05-17", 64, [0.2, 0.6, 0.2])
+    market = "KXHIGHNY-26MAY17-B66"  # official max 66 -> in bucket
+    # Bought 10 @ 40, sold 4 @ 55 -> closed 4 ($0.60), 6 held @ 40.
+    st.record_order("b1", market, "yes", 40, 10, "shadow-paper", action="buy")
+    st.record_order("s1", market, "yes", 55, 4, "shadow-paper", action="sell")
+    st.record_fill("b1", market, 40, 10)
+    st.record_fill("s1", market, 55, 4)
+    st.upsert_position(market, "yes", 6, 40, "2026-05-17")  # 0005 reduced 10 -> 6
+    res = settle_day(
+        station="NYC", climate_date="2026-05-17", db_path=db,
+        deps=Deps(), series_ticker="KXHIGHNY", mode="shadow-paper",
+    )
+    # held 6*(100-40)/100 = 3.60 ; round-trip 4*(55-40)/100 = 0.60 -> 4.20
+    assert res["realized_usd"] == pytest.approx(4.20)
+
+
+def test_settle_day_no_fills_held_to_settlement_unchanged(tmp_path):
+    """Held-to-settlement scoring is unchanged when there are no round-trip fills."""
+    db = str(tmp_path / "rt4.sqlite")
+    st = State(db)
+    st.init_schema()
+    st.record_prediction("NYC", "2026-05-17", 64, [0.2, 0.6, 0.2])
+    st.upsert_position("KXHIGHNY-26MAY17-B66", "yes", 5, 40, "2026-05-17")
+    res = settle_day(
+        station="NYC", climate_date="2026-05-17", db_path=db,
+        deps=Deps(), series_ticker="KXHIGHNY", mode="shadow-paper",
+    )
+    assert res["realized_usd"] == pytest.approx(3.0)  # held only, nothing added
+
+
+def test_settle_day_roundtrip_scoped_to_day(tmp_path):
+    """A round-trip on another day's market must not leak into this day's pnl."""
+    db = str(tmp_path / "rt5.sqlite")
+    st = State(db)
+    st.init_schema()
+    other = "KXHIGHNY-26MAY18-B65"  # a DIFFERENT climate day
+    st.record_order("b1", other, "yes", 40, 10, "shadow-paper", action="buy")
+    st.record_order("s1", other, "yes", 55, 10, "shadow-paper", action="sell")
+    st.record_fill("b1", other, 40, 10)
+    st.record_fill("s1", other, 55, 10)
+    res = settle_day(
+        station="NYC", climate_date="2026-05-17", db_path=db,
+        deps=Deps(), series_ticker="KXHIGHNY", mode="shadow-paper",
+    )
+    assert res["realized_usd"] == pytest.approx(0.0)  # 26MAY18 round-trip excluded
+
+
+def test_settle_day_roundtrip_idempotent(tmp_path):
+    """Re-running settle preserves the round-trip-inclusive pnl, never re-adds it (B5)."""
+    db = str(tmp_path / "rt6.sqlite")
+    st = State(db)
+    st.init_schema()
+    market = "KXHIGHNY-26MAY17-B65"
+    st.record_order("b1", market, "yes", 40, 10, "shadow-paper", action="buy")
+    st.record_order("s1", market, "yes", 55, 10, "shadow-paper", action="sell")
+    st.record_fill("b1", market, 40, 10)
+    st.record_fill("s1", market, 55, 10)
+    res1 = settle_day(
+        station="NYC", climate_date="2026-05-17", db_path=db,
+        deps=Deps(), series_ticker="KXHIGHNY", mode="shadow-paper",
+    )
+    assert res1["realized_usd"] == pytest.approx(1.50)
+    res2 = settle_day(
+        station="NYC", climate_date="2026-05-17", db_path=db,
+        deps=Deps(), series_ticker="KXHIGHNY", mode="shadow-paper",
+    )
+    assert res2["already_settled"] is True
+    assert res2["realized_usd"] == pytest.approx(1.50)  # preserved, not 3.00
+
+
 def test_well_calibrated_history_qualifies_end_to_end(tmp_path):
     """Prove the gate is passable by a realistic well-calibrated history.
 

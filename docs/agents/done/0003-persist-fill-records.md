@@ -50,3 +50,19 @@ danger zones. `eval/gate.py` is explicitly NOT touched.
 
 Per `CONTRIBUTING.md` — all six conditions, plus invariant B5 (settle
 idempotency) and A8 (gate untouched) explicitly re-verified.
+
+## Completion note (premise drift — re-scoped on delivery)
+
+This task's stated scope was partly already done and partly blocked when picked up:
+
+- **Already existed:** the `fills` table, `record_fill`, readers, and
+  `eval/metrics.roundtrip_pnl_stats` — so no table/helper was added.
+- **Blocked:** fills recorded no trade direction, and the shadow-paper exit
+  simulator *grew* positions on exit instead of closing them — so round-trip PnL
+  on top would have double-counted. That prerequisite was split out as **task
+  0005** (orders carry buy/sell `action`; paper exits reduce the position) and
+  landed first.
+- **Delivered here:** `settle_day` now scores closed buy→sell round-trips from
+  persisted fills (`_roundtrip_realized_usd`), scoped to the day by market-ticker
+  prefix (no schema change), added to `realized_usd` on the first-settle path
+  (idempotent re-run, B5). `eval/gate.py` untouched (A8). kaiju-reviewer: APPROVED.
